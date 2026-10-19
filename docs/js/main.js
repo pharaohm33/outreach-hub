@@ -42,8 +42,8 @@ function renderBanner() {
   const el = $('#banner');
   if (!s) { el.innerHTML = ''; return; }
   let msg = '';
-  if (!s.twilio_configured) msg = 'Your Worker has no Twilio credentials yet. Add <code>TWILIO_ACCOUNT_SID</code> and <code>TWILIO_AUTH_TOKEN</code> as secrets, then <a href="#/settings">finish setup in Settings</a>.';
-  else if (!s.voice_ready || !s.sms_ready) msg = 'Almost there: <a href="#/settings">pick your Twilio number in Settings</a> to enable texting and calling.';
+  if (!s.configured) msg = 'Your Worker has no SignalWire credentials yet. Add <code>SIGNALWIRE_SPACE</code>, <code>SIGNALWIRE_PROJECT_ID</code> and <code>SIGNALWIRE_API_TOKEN</code> as secrets, then <a href="#/settings">finish setup in Settings</a>.';
+  else if (!s.voice_ready || !s.sms_ready) msg = 'Almost there: <a href="#/settings">pick your SignalWire number and add your cell phone in Settings</a> to enable texting and calling.';
   el.innerHTML = msg ? `<div class="alert">${msg}</div>` : '';
 }
 

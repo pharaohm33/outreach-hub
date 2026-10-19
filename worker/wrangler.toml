@@ -17,5 +17,6 @@ crons = ["* * * * *"]
 
 # Secrets are NOT stored here. Add them with:
 #   npx wrangler secret put APP_PASSWORD
-#   npx wrangler secret put TWILIO_ACCOUNT_SID
-#   npx wrangler secret put TWILIO_AUTH_TOKEN
+#   npx wrangler secret put SIGNALWIRE_SPACE
+#   npx wrangler secret put SIGNALWIRE_PROJECT_ID
+#   npx wrangler secret put SIGNALWIRE_API_TOKEN

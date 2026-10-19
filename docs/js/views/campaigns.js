@@ -114,7 +114,7 @@ export default {
           renderPreview();
         } else if (act === 'process') {
           const r2 = await post('/sms/process');
-          toast(r2.skipped ? ({ outside_hours: 'Outside your sending hours, nothing sent', no_sender: 'Choose your Twilio number in Settings first' }[r2.skipped]) : `${r2.sent} sent${r2.failed ? `, ${r2.failed} failed` : ''}`);
+          toast(r2.skipped ? ({ outside_hours: 'Outside your sending hours, nothing sent', no_sender: 'Choose your SignalWire number in Settings first' }[r2.skipped]) : `${r2.sent} sent${r2.failed ? `, ${r2.failed} failed` : ''}`);
           await loadList();
         } else if (['pause', 'resume', 'cancel'].includes(act)) {
           if (act === 'cancel' && !(await confirmDialog('Cancel campaign?', 'Texts that have not been sent yet will be dropped.', 'Cancel campaign', true))) return;

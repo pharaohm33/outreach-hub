@@ -16,8 +16,8 @@ export default {
     ]);
     const s = ctx.status;
     const steps = [
-      [s.twilio_configured, 'Twilio credentials added to your Worker', 'Add <code>TWILIO_ACCOUNT_SID</code> and <code>TWILIO_AUTH_TOKEN</code> as Worker secrets.'],
-      [s.voice_ready && s.sms_ready, 'Twilio number connected', '<a href="#/settings">Pick your number in Settings.</a>'],
+      [s.configured, 'SignalWire credentials added to your Worker', 'Add <code>SIGNALWIRE_SPACE</code>, <code>SIGNALWIRE_PROJECT_ID</code> and <code>SIGNALWIRE_API_TOKEN</code> as Worker secrets.'],
+      [s.voice_ready && s.sms_ready, 'Number and your phone connected', '<a href="#/settings">Pick your number and add your cell phone in Settings.</a>'],
       [contacts.total > 0, 'Contacts imported', '<a href="#/contacts">Import a CSV of your subscribers.</a>'],
       [recs.length > 0, 'Voicemail recorded', '<a href="#/voicemails">Record or upload your voicemail drop.</a>'],
     ];

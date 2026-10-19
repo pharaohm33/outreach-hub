@@ -12,16 +12,18 @@ function render() {
     <div class="grid cols-2" style="align-items:start">
       <div class="grid">
         <div class="card">
-          <h2>Twilio</h2>
+          <h2>SignalWire</h2>
           <ul class="steps">
-            <li><span class="tick ${st.twilio_configured ? 'ok' : ''}">${st.twilio_configured ? '&#10003;' : ''}</span><div><strong>Credentials on your Worker</strong>
-              <div class="muted small">${st.twilio_configured ? 'Found TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN.' : 'In Cloudflare, add <code>TWILIO_ACCOUNT_SID</code> and <code>TWILIO_AUTH_TOKEN</code> as secrets on your Worker, then reload.'}</div></div></li>
-            <li><span class="tick ${st.sms_ready && st.voice_ready ? 'ok' : ''}">${st.sms_ready && st.voice_ready ? '&#10003;' : ''}</span><div><strong>Phone number</strong>
-              <div class="muted small">${s.from_number ? `Using ${esc(fmtPhone(s.from_number))}` : 'Pick the Twilio number to text and call from.'}</div></div></li>
+            <li><span class="tick ${st.configured ? 'ok' : ''}">${st.configured ? '&#10003;' : ''}</span><div><strong>Credentials on your Worker</strong>
+              <div class="muted small">${st.configured ? 'Found SIGNALWIRE_SPACE, SIGNALWIRE_PROJECT_ID and SIGNALWIRE_API_TOKEN.' : 'In Cloudflare, add <code>SIGNALWIRE_SPACE</code>, <code>SIGNALWIRE_PROJECT_ID</code> and <code>SIGNALWIRE_API_TOKEN</code> as secrets on your Worker, then reload.'}</div></div></li>
+            <li><span class="tick ${st.sms_ready && st.voice_ready ? 'ok' : ''}">${st.sms_ready && st.voice_ready ? '&#10003;' : ''}</span><div><strong>Number and your phone</strong>
+              <div class="muted small">${s.from_number ? `Sending from ${esc(fmtPhone(s.from_number))}${s.agent_phone ? `, calling you at ${esc(fmtPhone(s.agent_phone))}` : ''}` : 'Pick the SignalWire number to text and call from, and give your own cell phone.'}</div></div></li>
           </ul>
-          <div class="row" style="margin-top:8px"><button class="btn" data-act="numbers" ${st.twilio_configured ? '' : 'disabled'}>${s.from_number ? 'Change number' : 'Load my Twilio numbers'}</button></div>
+          <label style="margin-top:8px">Your cell phone <small>The dialer rings this number and connects each answered lead to you there.</small>
+            <input id="agent_phone" type="tel" value="${esc(s.agent_phone)}" placeholder="(415) 555-0100"></label>
+          <div class="row"><button class="btn" data-act="numbers" ${st.configured ? '' : 'disabled'}>${s.from_number ? 'Change number' : 'Load my SignalWire numbers'}</button></div>
           <div id="numbers" style="margin-top:12px"></div>
-          <p class="muted small" style="margin:12px 0 0">Connecting a number points its texting and calling webhooks at your Worker and creates the browser-calling credentials for you. US numbers also need A2P 10DLC registration in Twilio before carriers deliver marketing texts.</p>
+          <p class="muted small" style="margin:12px 0 0">Connecting a number points its texting and calling webhooks at your Worker, replacing whatever they pointed to before. Use a number that is not in use elsewhere. US numbers also need 10DLC registration in SignalWire before carriers deliver marketing texts.</p>
         </div>
 
         <div class="card">
@@ -61,10 +63,8 @@ function render() {
       <h2>This browser</h2>
       <p class="muted small">Connected to <code>${esc(workerUrl())}</code>. The password is kept only in this browser.</p>
       <details><summary class="small">Webhook URLs (set automatically when you connect a number)</summary>
-        <pre>Texts in:      ${esc(st.origin)}/twilio/sms
-Text status:   ${esc(st.origin)}/twilio/sms-status
-Browser calls: ${esc(st.origin)}/twilio/voice
-Calls in:      ${esc(st.origin)}/twilio/inbound-call</pre></details>
+        <pre>Texts in:  ${esc(st.origin)}/hook/sms?k=(secret, set for you)
+Calls in:  ${esc(st.origin)}/hook/inbound-call?k=(secret, set for you)</pre></details>
       <div class="row" style="margin-top:10px"><button class="btn danger" data-act="signout">Sign out</button></div>
     </div>`;
 }
@@ -74,8 +74,8 @@ const val = (id) => { const el = $('#' + id, root); return el.type === 'checkbox
 async function loadNumbers() {
   const box = $('#numbers', root);
   box.textContent = 'Loading…';
-  const nums = await get('/twilio/numbers');
-  if (!nums.length) { box.innerHTML = '<div class="alert">No phone numbers on this Twilio account yet. Buy one in the Twilio Console first.</div>'; return; }
+  const nums = await get('/numbers');
+  if (!nums.length) { box.innerHTML = '<div class="alert">No phone numbers on this SignalWire project yet. Buy one in your SignalWire dashboard first.</div>'; return; }
   const cur = ctx.status.settings.from_number;
   box.innerHTML = nums.map((n) => `<label class="inline" style="display:flex;margin-bottom:8px"><input type="radio" name="num" value="${n.sid}" data-phone="${esc(n.phone_number)}" ${n.phone_number === cur ? 'checked' : ''}>
     ${esc(fmtPhone(n.phone_number))} <span class="muted small">${esc(n.name)} ${n.sms ? '' : '(no SMS)'} ${n.voice ? '' : '(no voice)'}</span></label>`).join('')
@@ -97,13 +97,13 @@ export default {
           const pick = root.querySelector('input[name=num]:checked');
           if (!pick) return toast('Pick a number', 'error');
           b.disabled = true;
-          await post('/setup', { phone_sid: pick.value, phone_number: pick.dataset.phone });
+          await post('/setup', { phone_sid: pick.value, phone_number: pick.dataset.phone, agent_phone: $('#agent_phone', root).value.trim() });
           toast('Number connected. Texting and calling are ready.', 'success');
           await ctx.refreshStatus();
           render();
         } else if (act === 'save') {
           const body = {};
-          for (const id of ['sms_per_minute', 'messaging_service_sid', 'append_footer', 'sms_footer', 'timezone', 'window_start', 'window_end', 'max_attempts', 'min_hours', 'auto_vm', 'call_script']) body[id] = val(id);
+          for (const id of ['agent_phone', 'sms_per_minute', 'messaging_service_sid', 'append_footer', 'sms_footer', 'timezone', 'window_start', 'window_end', 'max_attempts', 'min_hours', 'auto_vm', 'call_script']) body[id] = val(id);
           ctx.status.settings = await put('/settings', body);
           toast('Settings saved', 'success');
           await ctx.refreshStatus();

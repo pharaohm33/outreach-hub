@@ -1,10 +1,9 @@
 // Dev harness: runs the real Worker code in the browser against an in-memory SQLite (sql.js)
-// with a fake Twilio, so the whole app can be exercised without a Cloudflare or Twilio account.
+// with a fake SignalWire, so the whole app can be exercised without any account.
 // Not part of the deployed site.
 import worker from '../worker/src/index.js';
 
 export const WORKER_ORIGIN = 'https://worker.test';
-export const AUTH_TOKEN = 'test_auth_token';
 export const PASSWORD = 'hunter2';
 
 export async function createBackend() {
@@ -35,45 +34,46 @@ export async function createBackend() {
     batch: async (stmts) => { const out = []; for (const s of stmts) out.push(await s.run()); return out; },
   };
 
-  const env = { DB, APP_PASSWORD: PASSWORD, TWILIO_ACCOUNT_SID: 'ACtest', TWILIO_AUTH_TOKEN: AUTH_TOKEN, ALLOWED_ORIGIN: '*' };
-  const twilioLog = [];
+  const env = { DB, APP_PASSWORD: PASSWORD, SIGNALWIRE_SPACE: 'test', SIGNALWIRE_PROJECT_ID: 'PJtest', SIGNALWIRE_API_TOKEN: 'tok', ALLOWED_ORIGIN: '*' };
+  const swLog = [];
   const realFetch = window.fetch.bind(window);
   let n = 1000;
-  const fakeTwilio = async (url, init) => {
+  const fakeSignalWire = async (url, init) => {
     const u = new URL(url);
     const params = Object.fromEntries(new URLSearchParams(init?.body || ''));
-    const path = u.pathname.replace(/^\/2010-04-01\/Accounts\/ACtest/, '');
-    twilioLog.push({ method: init?.method, path, params });
-    const ok = (o) => new Response(JSON.stringify(o), { status: 200 });
-    if (path === '.json') return ok({ sid: 'ACtest' });
-    if (path === '/Messages.json') return params.To === '+15550000000' ? new Response(JSON.stringify({ code: 21610, message: 'Unsubscribed recipient' }), { status: 400 }) : ok({ sid: 'SM' + n++ });
-    if (path === '/Calls.json') return ok({ sid: 'CA' + n++ });
-    if (path.startsWith('/Calls/')) return ok({ sid: path.split('/')[2].replace('.json', '') });
-    if (path.startsWith('/Applications')) return ok({ sid: 'APtest' });
-    if (path === '/Keys.json') return ok({ sid: 'SKtest', secret: 'keysecret' });
-    if (path.startsWith('/IncomingPhoneNumbers.json')) return ok({ incoming_phone_numbers: [{ sid: 'PN1', phone_number: '+14155550100', friendly_name: 'Main line', capabilities: { sms: true, voice: true } }] });
+    const path = u.pathname.replace(/^\/api\/laml\/2010-04-01\/Accounts\/PJtest/, '');
+    const entry = { method: init?.method, path, params, sid: null };
+    swLog.push(entry);
+    const ok = (o, status = 200) => new Response(JSON.stringify(o), { status });
+    if (path === '/Messages') {
+      if (params.To === '+15550000000') return ok({ code: 21610, message: 'Unsubscribed recipient' }, 400);
+      return ok({ sid: (entry.sid = 'SM' + n++) }, 201);
+    }
+    if (path === '/Calls') return ok({ sid: (entry.sid = 'CA' + n++), status: 'queued' }, 201);
+    if (path.startsWith('/Calls/')) return ok({ sid: path.split('/')[2] });
+    if (path === '/IncomingPhoneNumbers') return ok({ incoming_phone_numbers: [{ sid: 'PN1', phone_number: '+14155550100', friendly_name: 'Main line', capabilities: { sms: true, voice: true } }] });
     if (path.startsWith('/IncomingPhoneNumbers/')) return ok({ sid: 'PN1' });
-    return new Response(JSON.stringify({ message: 'not faked: ' + path }), { status: 404 });
+    return ok({ message: 'not faked: ' + path }, 404);
   };
 
   window.fetch = async (input, init) => {
     const req = input instanceof Request ? input : new Request(input, init);
     const url = new URL(req.url);
     if (url.origin === WORKER_ORIGIN) return worker.fetch(req, env);
-    if (url.hostname === 'api.twilio.com') return fakeTwilio(req.url, { method: req.method, body: await req.text() });
+    if (url.hostname === 'test.signalwire.com') return fakeSignalWire(req.url, { method: req.method, body: await req.text() });
     return realFetch(input, init);
   };
 
-  // Simulate Twilio calling a webhook on the Worker (signed like the real thing).
-  async function webhook(path, params) {
-    const full = WORKER_ORIGIN + path;
-    let data = full;
-    for (const k of Object.keys(params).sort()) data += k + params[k];
-    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(AUTH_TOKEN), { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
-    const sig = btoa(String.fromCharCode(...new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data)))));
-    const res = await fetch(full, { method: 'POST', body: new URLSearchParams(params), headers: { 'X-Twilio-Signature': sig } });
+  const webhookKey = () => JSON.parse(sdb.exec("SELECT value FROM settings WHERE key = 'webhook_key'")[0].values[0][0]);
+
+  // Simulate SignalWire calling a webhook on the Worker. `path` is like '/hook/lead-answer?call=1'.
+  async function webhook(path, params, { key = true } = {}) {
+    const sep = path.includes('?') ? '&' : '?';
+    const full = WORKER_ORIGIN + path + (key ? `${sep}k=${key === true ? webhookKey() : key}` : '');
+    const res = await fetch(full, { method: 'POST', body: new URLSearchParams(params) });
     return { status: res.status, text: await res.text() };
   }
+  const lastSid = (path) => swLog.filter((l) => l.path === path && l.sid).pop()?.sid;
 
-  return { env, worker, webhook, twilioLog, sdb };
+  return { env, worker, webhook, swLog, sdb, lastSid };
 }

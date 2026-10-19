@@ -1,13 +1,17 @@
 // Outreach Hub: Cloudflare Worker backend (single file, no dependencies).
-// Holds your Twilio secrets, stores contacts/messages/calls in D1, sends the SMS queue,
-// runs the voicemail-drop dialer logic and receives Twilio webhooks.
+// Holds your SignalWire credentials, stores contacts/messages/calls in D1, sends the SMS queue,
+// runs the voicemail-drop dialer logic and receives SignalWire webhooks.
 // The GitHub Pages UI talks to the /api/* routes with your APP_PASSWORD.
+//
+// Dialer design: when you start a session, SignalWire calls YOUR phone and parks you in a conference.
+// Each lead is dialed separately with answering-machine detection. A person is dropped into your
+// conference; a machine gets your recorded voicemail after the beep and is hung up on.
 
-const AGENT = 'agent';
 const MAX_AUDIO_B64 = 1_800_000; // keeps one D1 row under its 2 MB limit (~85 s of 8 kHz WAV)
 const OPT_OUT = /^\s*(stop|stopall|unsubscribe|cancel|end|quit)\s*[.!]*\s*$/i;
 const OPT_IN = /^\s*(start|unstop|yes)\s*[.!]*\s*$/i;
-const MACHINE = /^(machine_end_beep|machine_end_silence|machine_end_other|machine_start|fax)$/;
+const MACHINE = /^(machine|fax)/;
+const TERMINAL = ['completed', 'failed', 'busy', 'no-answer', 'canceled'];
 
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`,
@@ -28,17 +32,17 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT, contact_id INTEGER NOT NULL,
     direction TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL,
-    twilio_sid TEXT, error TEXT, campaign_id INTEGER,
+    provider_sid TEXT, error TEXT, campaign_id INTEGER,
     created_at INTEGER NOT NULL, sent_at INTEGER)`,
   `CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_id, id)`,
   `CREATE INDEX IF NOT EXISTS idx_messages_queue ON messages(status, id)`,
-  `CREATE INDEX IF NOT EXISTS idx_messages_sid ON messages(twilio_sid)`,
+  `CREATE INDEX IF NOT EXISTS idx_messages_sid ON messages(provider_sid)`,
   `CREATE TABLE IF NOT EXISTS calls (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, contact_id INTEGER, twilio_sid TEXT,
-    kind TEXT NOT NULL DEFAULT 'auto', to_number TEXT, status TEXT NOT NULL DEFAULT 'initiated',
+    id INTEGER PRIMARY KEY AUTOINCREMENT, contact_id INTEGER, provider_sid TEXT,
+    to_number TEXT, status TEXT NOT NULL DEFAULT 'initiated',
     answered_by TEXT, vm_dropped INTEGER NOT NULL DEFAULT 0, recording_id TEXT,
-    duration INTEGER NOT NULL DEFAULT 0, agent_status TEXT, disposition TEXT, notes TEXT NOT NULL DEFAULT '',
-    started_at INTEGER NOT NULL, answered_at INTEGER, ended_at INTEGER)`,
+    duration INTEGER NOT NULL DEFAULT 0, disposition TEXT, notes TEXT NOT NULL DEFAULT '',
+    started_at INTEGER NOT NULL, answered_at INTEGER, connected_at INTEGER, ended_at INTEGER)`,
   `CREATE INDEX IF NOT EXISTS idx_calls_started ON calls(started_at)`,
   `CREATE TABLE IF NOT EXISTS recordings (
     id TEXT PRIMARY KEY, name TEXT NOT NULL, mime TEXT NOT NULL, seconds REAL NOT NULL DEFAULT 0,
@@ -46,19 +50,20 @@ const SCHEMA = [
 ];
 
 const DEFAULTS = {
-  from_number: '', messaging_service_sid: '',
+  from_number: '', messaging_service_sid: '', agent_phone: '',
   // 11:00-20:00 Eastern is inside 8am-9pm for every continental US time zone.
   timezone: 'America/New_York', window_start: 11, window_end: 20,
   sms_per_minute: 20, sms_footer: 'Reply STOP to opt out.', append_footer: true,
   default_recording_id: '', auto_vm: true, call_script: '', max_attempts: 3, min_hours: 24,
-  public_url: '', twiml_app_sid: '', api_key_sid: '', api_key_secret: '',
+  // internal, never sent to the browser
+  public_url: '', webhook_key: '', session_conf: '', session_sid: '', session_status: 'none', session_started_at: 0,
 };
 const SETTING_TYPES = {
-  from_number: 'str', messaging_service_sid: 'str', timezone: 'str', window_start: 'int', window_end: 'int',
+  from_number: 'str', messaging_service_sid: 'str', agent_phone: 'str', timezone: 'str', window_start: 'int', window_end: 'int',
   sms_per_minute: 'int', sms_footer: 'str', append_footer: 'bool', default_recording_id: 'str',
   auto_vm: 'bool', call_script: 'str', max_attempts: 'int', min_hours: 'int',
 };
-const SECRET_SETTINGS = ['api_key_secret'];
+const INTERNAL_SETTINGS = ['webhook_key', 'session_conf', 'session_sid', 'session_status', 'session_started_at'];
 
 class ApiError extends Error {
   constructor(status, message, code) { super(message); this.status = status; this.code = code; }
@@ -68,17 +73,12 @@ class ApiError extends Error {
 const enc = (s) => new TextEncoder().encode(s);
 const json = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
 const esc = (s) => String(s ?? '').replace(/[<>&"']/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' }[c]));
-const twiml = (inner) => new Response(`<?xml version="1.0" encoding="UTF-8"?><Response>${inner}</Response>`, { headers: { 'content-type': 'text/xml' } });
-const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const cxml = (inner) => new Response(`<?xml version="1.0" encoding="UTF-8"?><Response>${inner}</Response>`, { headers: { 'content-type': 'text/xml' } });
 const prep = (env, sql, ...b) => env.DB.prepare(sql).bind(...b);
 const all = async (env, sql, ...b) => (await prep(env, sql, ...b).all()).results;
 const first = (env, sql, ...b) => prep(env, sql, ...b).first();
 const run = (env, sql, ...b) => prep(env, sql, ...b).run();
 
-async function hmac(hash, key, data) {
-  const k = await crypto.subtle.importKey('raw', enc(key), { name: 'HMAC', hash }, false, ['sign']);
-  return crypto.subtle.sign('HMAC', k, enc(data));
-}
 async function safeEqual(a, b) {
   const [x, y] = await Promise.all([crypto.subtle.digest('SHA-256', enc(String(a))), crypto.subtle.digest('SHA-256', enc(String(b)))]);
   const xa = new Uint8Array(x), ya = new Uint8Array(y);
@@ -86,7 +86,7 @@ async function safeEqual(a, b) {
   for (let i = 0; i < xa.length; i++) d |= xa[i] ^ ya[i];
   return d === 0;
 }
-const randomId = () => [...crypto.getRandomValues(new Uint8Array(12))].map((b) => b.toString(16).padStart(2, '0')).join('');
+const randomId = (bytes = 12) => [...crypto.getRandomValues(new Uint8Array(bytes))].map((b) => b.toString(16).padStart(2, '0')).join('');
 
 /** "(415) 555-2671", "415-555-2671", "1 415 555 2671", "+44 20 7946 0958" -> E.164, or null */
 function normPhone(raw) {
@@ -121,72 +121,69 @@ async function getSettings(env) {
   const rows = await all(env, 'SELECT key, value FROM settings');
   const s = { ...DEFAULTS };
   for (const r of rows) { try { s[r.key] = JSON.parse(r.value); } catch { /* ignore bad row */ } }
+  if (!s.webhook_key) { // random secret that goes into every webhook URL we give SignalWire
+    s.webhook_key = randomId(24);
+    await saveSettings(env, { webhook_key: s.webhook_key });
+  }
   return s;
 }
-const publicSettings = (s) => Object.fromEntries(Object.entries(s).filter(([k]) => !SECRET_SETTINGS.includes(k)));
+const publicSettings = (s) => Object.fromEntries(Object.entries(s).filter(([k]) => !INTERNAL_SETTINGS.includes(k)));
 async function saveSettings(env, obj) {
   const stmts = Object.entries(obj).map(([k, v]) =>
     prep(env, 'INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', k, JSON.stringify(v)));
   if (stmts.length) await env.DB.batch(stmts);
 }
-
-/* ---------- Twilio ---------- */
-function needTwilio(env) {
-  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN) throw new ApiError(400, 'Add TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN as secrets on your Worker first.');
+/** Webhook URL with the secret key attached. SignalWire calls these; nobody else knows the key. */
+function hookUrl(origin, s, route, params = {}) {
+  const u = new URL(`${origin}/hook/${route}`);
+  u.searchParams.set('k', s.webhook_key);
+  for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
+  return u.toString();
 }
-async function tw(env, method, path, params) {
-  needTwilio(env);
-  const init = { method, headers: { Authorization: 'Basic ' + btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`) } };
+
+/* ---------- SignalWire REST (Twilio-compatible "LaML" API) ---------- */
+function needSW(env) {
+  if (!env.SIGNALWIRE_SPACE || !env.SIGNALWIRE_PROJECT_ID || !env.SIGNALWIRE_API_TOKEN) {
+    throw new ApiError(400, 'Add SIGNALWIRE_SPACE, SIGNALWIRE_PROJECT_ID and SIGNALWIRE_API_TOKEN as secrets on your Worker first.');
+  }
+}
+function swHost(env) {
+  const h = String(env.SIGNALWIRE_SPACE).trim().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  return h.includes('.') ? h : `${h}.signalwire.com`;
+}
+async function sw(env, method, path, params) {
+  needSW(env);
+  const init = { method, headers: { Authorization: 'Basic ' + btoa(`${env.SIGNALWIRE_PROJECT_ID}:${env.SIGNALWIRE_API_TOKEN}`), Accept: 'application/json' } };
   if (params) {
     const body = new URLSearchParams();
     for (const [k, v] of Object.entries(params)) if (v != null && v !== '') body.append(k, String(v));
     init.body = body;
     init.headers['content-type'] = 'application/x-www-form-urlencoded';
   }
-  const r = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${env.TWILIO_ACCOUNT_SID}${path}`, init);
+  const r = await fetch(`https://${swHost(env)}/api/laml/2010-04-01/Accounts/${env.SIGNALWIRE_PROJECT_ID}${path}`, init);
   const text = await r.text();
   let data;
   try { data = JSON.parse(text); } catch { data = { message: text.slice(0, 200) }; }
   if (!r.ok) {
-    if (r.status === 401) throw new ApiError(502, 'Twilio rejected the Account SID / Auth Token. Check the Worker secrets.');
-    throw new ApiError(400, `Twilio: ${data.message || r.statusText}`, data.code);
+    if (r.status === 401 || r.status === 403) throw new ApiError(502, 'SignalWire rejected the Project ID / API token (or the token lacks the needed permissions). Check the Worker secrets.');
+    throw new ApiError(400, `SignalWire: ${data.message || data.error || r.statusText}`, data.code);
   }
   return data;
 }
 
-/** Twilio signs every webhook: HMAC-SHA1 over full URL + sorted POST params, base64. */
-async function validSignature(env, urlString, params, signature) {
-  if (!signature || !env.TWILIO_AUTH_TOKEN) return false;
-  let data = urlString;
-  for (const k of Object.keys(params).sort()) data += k + params[k];
-  const expected = btoa(String.fromCharCode(...new Uint8Array(await hmac('SHA-1', env.TWILIO_AUTH_TOKEN, data))));
-  return safeEqual(expected, signature);
-}
-
-async function accessToken(env, s) {
-  const now = Math.floor(Date.now() / 1000);
-  const header = { alg: 'HS256', typ: 'JWT', cty: 'twilio-fpa;v=1' };
-  const payload = {
-    jti: `${s.api_key_sid}-${now}`, iss: s.api_key_sid, sub: env.TWILIO_ACCOUNT_SID, iat: now, exp: now + 3600,
-    grants: { identity: AGENT, voice: { incoming: { allow: true }, outgoing: { application_sid: s.twiml_app_sid } } },
-  };
-  const input = b64u(enc(JSON.stringify(header))) + '.' + b64u(enc(JSON.stringify(payload)));
-  return input + '.' + b64u(await hmac('SHA-256', s.api_key_secret, input));
-}
-
 /* ---------- SMS sending ---------- */
 async function sendOne(env, msg, contact, s, origin) {
-  const params = { To: contact.phone, Body: msg.body, StatusCallback: `${origin}/twilio/sms-status` };
+  const params = { To: contact.phone, Body: msg.body, StatusCallback: hookUrl(origin, s, 'sms-status') };
   if (s.messaging_service_sid) params.MessagingServiceSid = s.messaging_service_sid;
   else params.From = s.from_number;
   const now = Date.now();
   try {
-    const d = await tw(env, 'POST', '/Messages.json', params);
+    const d = await sw(env, 'POST', '/Messages', params);
     await env.DB.batch([
-      prep(env, "UPDATE messages SET status = 'sent', twilio_sid = ?, sent_at = ?, error = NULL WHERE id = ?", d.sid, now, msg.id),
+      prep(env, "UPDATE messages SET status = 'sent', provider_sid = ?, sent_at = ?, error = NULL WHERE id = ?", d.sid, now, msg.id),
       prep(env, 'UPDATE contacts SET last_message_at = ?, updated_at = ? WHERE id = ?', now, now, contact.id),
     ]);
-    return { ...msg, status: 'sent', twilio_sid: d.sid, sent_at: now };
+    return { ...msg, status: 'sent', provider_sid: d.sid, sent_at: now };
   } catch (e) {
     const stmts = [prep(env, "UPDATE messages SET status = 'failed', error = ?, sent_at = ? WHERE id = ?", e.message, now, msg.id)];
     if (e.code === 21610) stmts.push(prep(env, 'UPDATE contacts SET sms_opt_out = 1, updated_at = ? WHERE id = ?', now, contact.id)); // recipient replied STOP
@@ -273,7 +270,7 @@ function corsHeaders(request, env) {
 
 export default {
   // Exposed only so the browser test page can reach them; Workers ignore extra properties.
-  __test: { normPhone, inWindow, validSignature },
+  __test: { normPhone, inWindow },
 
   async fetch(request, env) {
     const cors = corsHeaders(request, env);
@@ -282,7 +279,7 @@ export default {
     let res;
     try {
       await ensureSchema(env);
-      if (url.pathname.startsWith('/twilio/')) res = await twilioHook(request, env, url);
+      if (url.pathname.startsWith('/hook/')) res = await webhook(request, env, url);
       else if (url.pathname.startsWith('/audio/')) res = await serveAudio(env, url);
       else if (url.pathname.startsWith('/api/')) res = await api(request, env, url);
       else res = json({ ok: true, service: 'outreach-hub' });
@@ -315,22 +312,25 @@ async function serveAudio(env, url) {
   return new Response(bytes, { headers: { 'content-type': r.mime, 'cache-control': 'public, max-age=3600' } });
 }
 
-/* ---------- Twilio webhooks (signature checked) ---------- */
-async function twilioHook(request, env, url) {
-  if (request.method !== 'POST') return new Response('POST only', { status: 405 });
+/* ---------- SignalWire webhooks (secret key in the URL) ---------- */
+const conference = (name, host) =>
+  `<Dial><Conference beep="false" startConferenceOnEnter="${host}" endConferenceOnExit="${host}" waitUrl="">${esc(name)}</Conference></Dial>`;
+
+async function webhook(request, env, url) {
+  if (request.method !== 'POST' && request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
+  const s = await getSettings(env);
+  if (!(await safeEqual(url.searchParams.get('k') || '', s.webhook_key))) return new Response('Forbidden', { status: 403 });
   const params = {};
-  for (const [k, v] of (await request.formData()).entries()) params[k] = String(v);
-  if (!(await validSignature(env, request.url, params, request.headers.get('X-Twilio-Signature')))) {
-    return new Response('Invalid signature', { status: 403 });
-  }
+  if (request.method === 'POST') for (const [k, v] of (await request.formData()).entries()) params[k] = String(v);
+  else for (const [k, v] of url.searchParams.entries()) params[k] = v;
   const origin = url.origin;
-  const route = url.pathname.slice('/twilio/'.length);
+  const route = url.pathname.slice('/hook/'.length);
   const callId = Number(url.searchParams.get('call')) || 0;
   const now = Date.now();
 
   if (route === 'sms') {
     const phone = normPhone(params.From);
-    if (!phone) return twiml('');
+    if (!phone) return cxml('');
     let c = await first(env, 'SELECT * FROM contacts WHERE phone = ?', phone);
     if (!c) {
       const r = await run(env, "INSERT INTO contacts(phone, tags, created_at, updated_at) VALUES(?, ',inbound,', ?, ?)", phone, now, now);
@@ -338,47 +338,71 @@ async function twilioHook(request, env, url) {
     }
     const body = params.Body || (Number(params.NumMedia) ? '[media message]' : '');
     const stmts = [
-      prep(env, "INSERT INTO messages(contact_id, direction, body, status, twilio_sid, created_at) VALUES(?, 'in', ?, 'received', ?, ?)", c.id, body, params.MessageSid || null, now),
+      prep(env, "INSERT INTO messages(contact_id, direction, body, status, provider_sid, created_at) VALUES(?, 'in', ?, 'received', ?, ?)", c.id, body, params.MessageSid || null, now),
       prep(env, 'UPDATE contacts SET last_message_at = ?, unread = unread + 1, updated_at = ? WHERE id = ?', now, now, c.id),
     ];
+    let reply = '';
     if (OPT_OUT.test(body)) {
       stmts.push(prep(env, 'UPDATE contacts SET sms_opt_out = 1 WHERE id = ?', c.id));
       stmts.push(prep(env, "UPDATE messages SET status = 'cancelled' WHERE contact_id = ? AND status IN ('queued', 'sending')", c.id));
+      reply = '<Message>You have been unsubscribed and will not receive more texts. Reply START to resubscribe.</Message>';
     } else if (OPT_IN.test(body)) {
       stmts.push(prep(env, 'UPDATE contacts SET sms_opt_out = 0 WHERE id = ?', c.id));
     }
     await env.DB.batch(stmts);
-    return twiml(''); // Twilio sends the standard STOP/HELP replies itself
+    return cxml(reply);
   }
 
   if (route === 'sms-status') {
     const rank = { queued: 1, sending: 2, sent: 3, undelivered: 4, failed: 4, delivered: 5 };
     const st = params.MessageStatus;
     if (params.MessageSid && rank[st]) {
-      await run(env, `UPDATE messages SET status = ?, error = ? WHERE twilio_sid = ? AND direction = 'out'
+      await run(env, `UPDATE messages SET status = ?, error = ? WHERE provider_sid = ? AND direction = 'out'
         AND status IN ('sent', 'sending', 'queued', 'undelivered', 'failed') AND (? >= CASE status WHEN 'queued' THEN 1 WHEN 'sending' THEN 2 WHEN 'sent' THEN 3 ELSE 4 END)`,
         st, params.ErrorCode ? `Error ${params.ErrorCode}` : null, params.MessageSid, rank[st]);
       if (params.ErrorCode === '21610') {
-        await run(env, "UPDATE contacts SET sms_opt_out = 1 WHERE id = (SELECT contact_id FROM messages WHERE twilio_sid = ?)", params.MessageSid);
+        await run(env, 'UPDATE contacts SET sms_opt_out = 1 WHERE id = (SELECT contact_id FROM messages WHERE provider_sid = ?)', params.MessageSid);
       }
     }
     return new Response(null, { status: 204 });
   }
 
-  // The lead picked up. With machine detection on, Twilio calls this only after it decided who answered.
+  // Your phone picked up the session call: park it in the conference.
+  if (route === 'agent-answer') {
+    if (!params.CallSid || params.CallSid !== s.session_sid) return cxml('<Hangup/>');
+    await saveSettings(env, { session_status: 'active', session_started_at: now });
+    return cxml(`<Say>Dialer connected. Stay on the line.</Say>${conference(s.session_conf, true)}`);
+  }
+  // Your session call ended (you hung up, did not answer, or the dialer ended it).
+  if (route === 'agent-status') {
+    if (params.CallSid && params.CallSid === s.session_sid) await saveSettings(env, { session_status: 'ended' });
+    return new Response(null, { status: 204 });
+  }
+
+  // The lead picked up. With machine detection on, SignalWire calls this only after it decided who answered.
   if (route === 'lead-answer') {
     const call = await first(env, 'SELECT * FROM calls WHERE id = ?', callId);
-    if (!call) return twiml('<Hangup/>');
+    if (!call) return cxml('<Hangup/>');
     const answeredBy = params.AnsweredBy || 'unknown';
     await run(env, "UPDATE calls SET status = 'in-progress', answered_by = ?, answered_at = ? WHERE id = ?", answeredBy, now, callId);
     if (MACHINE.test(answeredBy)) {
       if (call.recording_id && answeredBy !== 'fax') {
         await run(env, 'UPDATE calls SET vm_dropped = 1 WHERE id = ?', callId);
-        return twiml(`<Play>${esc(`${origin}/audio/${call.recording_id}.wav`)}</Play><Hangup/>`);
+        return cxml(`<Play>${esc(`${origin}/audio/${call.recording_id}.wav`)}</Play><Hangup/>`);
       }
-      return twiml('<Hangup/>');
+      return cxml('<Hangup/>');
     }
-    return twiml(`<Dial answerOnBridge="true" timeout="20" action="${esc(`${origin}/twilio/dial-action?call=${callId}`)}"><Client>${AGENT}</Client></Dial>`);
+    if (s.session_status !== 'active' || !s.session_conf) {
+      return cxml('<Say>Sorry, nobody is available to take your call right now. Goodbye.</Say><Hangup/>');
+    }
+    await run(env, 'UPDATE calls SET connected_at = ? WHERE id = ?', now, callId);
+    return cxml(conference(s.session_conf, false));
+  }
+
+  // Redirect target for the manual "Drop voicemail" button.
+  if (route === 'play') {
+    const rec = String(url.searchParams.get('rec') || '').replace(/[^0-9a-f]/g, '');
+    return cxml(`<Play>${esc(`${origin}/audio/${rec}.wav`)}</Play><Hangup/>`);
   }
 
   if (route === 'call-status') {
@@ -395,35 +419,10 @@ async function twilioHook(request, env, url) {
     return new Response(null, { status: 204 });
   }
 
-  // After <Dial> ends (agent leg finished or never connected).
-  if (route === 'dial-action') {
-    const call = await first(env, 'SELECT * FROM calls WHERE id = ?', callId);
-    const st = params.DialCallStatus || 'completed';
-    if (call) {
-      if (call.kind === 'manual') {
-        await run(env, 'UPDATE calls SET status = ?, agent_status = ?, duration = ?, ended_at = ? WHERE id = ?', st, st, Number(params.DialCallDuration) || 0, now, callId);
-      } else {
-        await run(env, 'UPDATE calls SET agent_status = ? WHERE id = ?', st, callId);
-      }
-    }
-    return twiml(st === 'completed' ? '<Hangup/>' : '<Say>Sorry, we could not connect you. Goodbye.</Say><Hangup/>');
-  }
-
-  // Browser softphone typed a number (Device.connect). Twilio sends the TwiML App's request here.
-  if (route === 'voice') {
-    const to = normPhone(params.To);
-    if (!to) return twiml('<Say>That number is not valid.</Say><Hangup/>');
-    const s = await getSettings(env);
-    const c = await first(env, 'SELECT id, dnc FROM contacts WHERE phone = ?', to);
-    if (c && c.dnc) return twiml('<Say>That number is on your do not call list.</Say><Hangup/>');
-    const r = await run(env, "INSERT INTO calls(contact_id, twilio_sid, kind, to_number, status, started_at) VALUES(?, ?, 'manual', ?, 'in-progress', ?)",
-      c ? c.id : null, params.CallSid || null, to, now);
-    return twiml(`<Dial callerId="${esc(s.from_number)}" answerOnBridge="true" action="${esc(`${origin}/twilio/dial-action?call=${r.meta.last_row_id}`)}"><Number>${esc(to)}</Number></Dial>`);
-  }
-
-  // Someone calls your Twilio number back: ring the browser softphone.
+  // Someone calls your number back: ring your phone.
   if (route === 'inbound-call') {
-    return twiml(`<Dial timeout="20"><Client>${AGENT}</Client></Dial><Say>Sorry, nobody is available right now. Please send us a text message.</Say>`);
+    const fallback = '<Say>Sorry, nobody is available right now. Please send us a text message.</Say>';
+    return cxml(s.agent_phone ? `<Dial timeout="20">${esc(s.agent_phone)}</Dial>${fallback}` : fallback);
   }
 
   return new Response('Unknown webhook', { status: 404 });
@@ -461,14 +460,16 @@ function contactFilter(q) {
   return { where: w.length ? 'WHERE ' + w.join(' AND ') : '', b };
 }
 
+const sessionInfo = (s) => ({ status: s.session_status, started_at: s.session_started_at, agent_phone: s.agent_phone });
+
 const ROUTES = [
   ['GET', /^\/status$/, async ({ env, origin }) => {
     const s = await getSettings(env);
     if (s.public_url !== origin) { await saveSettings(env, { public_url: origin }); s.public_url = origin; }
     return {
-      twilio_configured: !!(env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN),
-      voice_ready: !!(s.api_key_sid && s.api_key_secret && s.twiml_app_sid),
+      configured: !!(env.SIGNALWIRE_SPACE && env.SIGNALWIRE_PROJECT_ID && env.SIGNALWIRE_API_TOKEN),
       sms_ready: !!(s.from_number || s.messaging_service_sid),
+      voice_ready: !!(s.from_number && s.agent_phone),
       origin, settings: publicSettings(s),
     };
   }],
@@ -482,7 +483,13 @@ const ROUTES = [
       else if (type === 'bool') out[k] = !!body[k];
       else out[k] = String(body[k] ?? '').trim();
     }
-    if ('from_number' in out && out.from_number) out.from_number = normPhone(out.from_number) || out.from_number;
+    for (const k of ['from_number', 'agent_phone']) {
+      if (k in out && out[k]) {
+        const p = normPhone(out[k]);
+        if (!p) throw new ApiError(400, `That ${k === 'agent_phone' ? 'phone number for your own phone' : 'sending number'} is not valid.`);
+        out[k] = p;
+      }
+    }
     if ('timezone' in out) {
       try { new Intl.DateTimeFormat('en-US', { timeZone: out.timezone }); } catch { throw new ApiError(400, 'Unknown time zone'); }
     }
@@ -491,38 +498,25 @@ const ROUTES = [
     return publicSettings(await getSettings(env));
   }],
 
-  // One-click Twilio wiring: TwiML App (browser calling), API key (access tokens), number webhooks.
-  ['GET', /^\/twilio\/numbers$/, async ({ env }) => {
-    const d = await tw(env, 'GET', '/IncomingPhoneNumbers.json?PageSize=100');
-    return (d.incoming_phone_numbers || []).map((n) => ({ sid: n.sid, phone_number: n.phone_number, name: n.friendly_name, sms: !!n.capabilities?.sms, voice: !!n.capabilities?.voice }));
+  // One-click wiring: point the number's text and call webhooks at this Worker and remember your own phone.
+  ['GET', /^\/numbers$/, async ({ env }) => {
+    const d = await sw(env, 'GET', '/IncomingPhoneNumbers?PageSize=100');
+    const list = d.incoming_phone_numbers || d.data || [];
+    return list.map((n) => ({ sid: n.sid || n.id, phone_number: n.phone_number || n.number, name: n.friendly_name || n.name || '', sms: n.capabilities ? !!n.capabilities.sms : true, voice: n.capabilities ? !!n.capabilities.voice : true }));
   }],
   ['POST', /^\/setup$/, async ({ env, body, origin }) => {
     const phone = normPhone(body.phone_number);
-    if (!body.phone_sid || !phone) throw new ApiError(400, 'Pick one of your Twilio numbers.');
-    await tw(env, 'GET', '.json'); // verifies the credentials
+    const agent = normPhone(body.agent_phone);
+    if (!body.phone_sid || !phone) throw new ApiError(400, 'Pick one of your SignalWire numbers.');
+    if (!agent) throw new ApiError(400, 'Enter your own cell phone number (the dialer will call you there).');
+    if (agent === phone) throw new ApiError(400, 'Your own phone must be different from the SignalWire number.');
     const s = await getSettings(env);
-    const appParams = { FriendlyName: 'Outreach Hub', VoiceUrl: `${origin}/twilio/voice`, VoiceMethod: 'POST' };
-    let appSid = s.twiml_app_sid;
-    if (appSid) {
-      try { await tw(env, 'POST', `/Applications/${appSid}.json`, appParams); } catch { appSid = ''; }
-    }
-    if (!appSid) appSid = (await tw(env, 'POST', '/Applications.json', appParams)).sid;
-    const save = { twiml_app_sid: appSid, from_number: phone, public_url: origin };
-    if (!s.api_key_sid || !s.api_key_secret) {
-      const key = await tw(env, 'POST', '/Keys.json', { FriendlyName: 'Outreach Hub' });
-      save.api_key_sid = key.sid;
-      save.api_key_secret = key.secret;
-    }
-    await tw(env, 'POST', `/IncomingPhoneNumbers/${body.phone_sid}.json`, {
-      SmsUrl: `${origin}/twilio/sms`, SmsMethod: 'POST', VoiceUrl: `${origin}/twilio/inbound-call`, VoiceMethod: 'POST',
+    await sw(env, 'POST', `/IncomingPhoneNumbers/${body.phone_sid}`, {
+      SmsUrl: hookUrl(origin, s, 'sms'), SmsMethod: 'POST',
+      VoiceUrl: hookUrl(origin, s, 'inbound-call'), VoiceMethod: 'POST',
     });
-    await saveSettings(env, save);
+    await saveSettings(env, { from_number: phone, agent_phone: agent, public_url: origin });
     return { ok: true, from_number: phone };
-  }],
-  ['POST', /^\/voice\/token$/, async ({ env }) => {
-    const s = await getSettings(env);
-    if (!(s.api_key_sid && s.api_key_secret && s.twiml_app_sid)) throw new ApiError(400, 'Finish the Twilio setup in Settings first.');
-    return { token: await accessToken(env, s), identity: AGENT };
   }],
 
   /* contacts */
@@ -644,7 +638,7 @@ const ROUTES = [
     if (!text) throw new ApiError(400, 'Write a message first');
     if (c.sms_opt_out) throw new ApiError(400, 'This contact opted out of texts. Sending is blocked.');
     const s = await getSettings(env);
-    if (!s.from_number && !s.messaging_service_sid) throw new ApiError(400, 'Choose your Twilio number in Settings first.');
+    if (!s.from_number && !s.messaging_service_sid) throw new ApiError(400, 'Choose your SignalWire number in Settings first.');
     const now = Date.now();
     const r = await run(env, "INSERT INTO messages(contact_id, direction, body, status, created_at) VALUES(?, 'out', ?, 'sending', ?)", c.id, text, now);
     const msg = await sendOne(env, { id: r.meta.last_row_id, body: text, direction: 'out', contact_id: c.id, created_at: now }, c, s, origin);
@@ -665,7 +659,7 @@ const ROUTES = [
     let text = String(body.body || '').trim();
     if (!text) throw new ApiError(400, 'Write the message first');
     const s = await getSettings(env);
-    if (!s.from_number && !s.messaging_service_sid) throw new ApiError(400, 'Choose your Twilio number in Settings first.');
+    if (!s.from_number && !s.messaging_service_sid) throw new ApiError(400, 'Choose your SignalWire number in Settings first.');
     if (body.append_footer ?? s.append_footer) {
       if (s.sms_footer && !text.toLowerCase().includes('stop')) text += '\n' + s.sms_footer;
     }
@@ -719,10 +713,44 @@ const ROUTES = [
     return { ok: true };
   }],
 
+  /* dialer session: SignalWire calls your phone and keeps you in a conference */
+  ['GET', /^\/dialer\/session$/, async ({ env }) => sessionInfo(await getSettings(env))],
+  ['POST', /^\/dialer\/session\/start$/, async ({ env, origin }) => {
+    const s = await getSettings(env);
+    if (!s.from_number) throw new ApiError(400, 'Choose your SignalWire number in Settings first.');
+    if (!s.agent_phone) throw new ApiError(400, 'Add your own cell phone number in Settings first.');
+    if (s.session_sid && s.session_status !== 'ended' && s.session_status !== 'none') {
+      try { await sw(env, 'POST', `/Calls/${s.session_sid}`, { Status: 'completed' }); } catch { /* already over */ }
+    }
+    const conf = 'oh-' + randomId(6);
+    await saveSettings(env, { session_conf: conf, session_sid: '', session_status: 'ringing', session_started_at: Date.now() });
+    s.session_conf = conf;
+    try {
+      const d = await sw(env, 'POST', '/Calls', {
+        To: s.agent_phone, From: s.from_number, Timeout: 45,
+        Url: hookUrl(origin, s, 'agent-answer'), Method: 'POST',
+        StatusCallback: hookUrl(origin, s, 'agent-status'), StatusCallbackMethod: 'POST',
+      });
+      await saveSettings(env, { session_sid: d.sid });
+    } catch (e) {
+      await saveSettings(env, { session_status: 'ended' });
+      throw e;
+    }
+    return sessionInfo(await getSettings(env));
+  }],
+  ['POST', /^\/dialer\/session\/end$/, async ({ env }) => {
+    const s = await getSettings(env);
+    if (s.session_sid && s.session_status !== 'ended') {
+      try { await sw(env, 'POST', `/Calls/${s.session_sid}`, { Status: 'completed' }); } catch { /* already over */ }
+    }
+    await saveSettings(env, { session_status: 'ended' });
+    return sessionInfo(await getSettings(env));
+  }],
+
   /* dialer */
   ['GET', /^\/dialer\/queue$/, async ({ env, query }) => {
     const s = await getSettings(env);
-    const w = ["dnc = 0", "status NOT IN ('not_interested', 'wrong_number', 'dnc', 'interested')", 'call_attempts < ?', '(last_called_at IS NULL OR last_called_at < ?)'];
+    const w = ['dnc = 0', "status NOT IN ('not_interested', 'wrong_number', 'dnc', 'interested')", 'call_attempts < ?', '(last_called_at IS NULL OR last_called_at < ?)'];
     const maxAttempts = Number(query.max_attempts) || s.max_attempts || 3;
     const minHours = query.min_hours != null && query.min_hours !== '' ? Number(query.min_hours) : s.min_hours;
     const b = [maxAttempts, Date.now() - minHours * 3600000];
@@ -736,24 +764,24 @@ const ROUTES = [
     const c = await getContact(env, body.contact_id);
     if (c.dnc) throw new ApiError(400, 'This number is on your do-not-call list.');
     const s = await getSettings(env);
-    if (!s.from_number) throw new ApiError(400, 'Choose your Twilio number in Settings first.');
-    if (!(s.api_key_sid && s.twiml_app_sid)) throw new ApiError(400, 'Finish the Twilio setup in Settings first.');
+    if (!s.from_number) throw new ApiError(400, 'Choose your SignalWire number in Settings first.');
+    if (s.session_status !== 'active') throw new ApiError(400, 'Start your dialer session first. It will call your phone.');
     if (!inWindow(s)) throw new ApiError(400, `Outside your calling hours (${s.window_start}:00 to ${s.window_end}:00 ${s.timezone}). Change them in Settings if needed.`);
     const recordingId = body.auto_vm ? (body.recording_id || s.default_recording_id || '') : '';
     if (body.auto_vm && !recordingId) throw new ApiError(400, 'Record or upload a voicemail first, or turn off automatic voicemail drop.');
     const now = Date.now();
-    const r = await run(env, "INSERT INTO calls(contact_id, kind, to_number, status, recording_id, started_at) VALUES(?, 'auto', ?, 'initiated', ?, ?)",
+    const r = await run(env, "INSERT INTO calls(contact_id, to_number, status, recording_id, started_at) VALUES(?, ?, 'initiated', ?, ?)",
       c.id, c.phone, recordingId || null, now);
     const id = r.meta.last_row_id;
     try {
-      const d = await tw(env, 'POST', '/Calls.json', {
+      const d = await sw(env, 'POST', '/Calls', {
         To: c.phone, From: s.from_number,
-        Url: `${origin}/twilio/lead-answer?call=${id}`, Method: 'POST',
-        StatusCallback: `${origin}/twilio/call-status?call=${id}`, StatusCallbackMethod: 'POST',
+        Url: hookUrl(origin, s, 'lead-answer', { call: id }), Method: 'POST',
+        StatusCallback: hookUrl(origin, s, 'call-status', { call: id }), StatusCallbackMethod: 'POST',
         MachineDetection: 'DetectMessageEnd', MachineDetectionTimeout: 30, Timeout: 25,
       });
       await env.DB.batch([
-        prep(env, 'UPDATE calls SET twilio_sid = ? WHERE id = ?', d.sid, id),
+        prep(env, 'UPDATE calls SET provider_sid = ? WHERE id = ?', d.sid, id),
         prep(env, 'UPDATE contacts SET call_attempts = call_attempts + 1, last_called_at = ?, updated_at = ? WHERE id = ?', now, now, c.id),
       ]);
     } catch (e) {
@@ -772,8 +800,8 @@ const ROUTES = [
   }],
   ['POST', /^\/calls\/(\d+)\/hangup$/, async ({ env, args }) => {
     const call = await getCall(env, args[0]);
-    if (call.twilio_sid && !['completed', 'failed', 'busy', 'no-answer', 'canceled'].includes(call.status)) {
-      try { await tw(env, 'POST', `/Calls/${call.twilio_sid}.json`, { Status: 'completed' }); } catch { /* already ended */ }
+    if (call.provider_sid && !TERMINAL.includes(call.status)) {
+      try { await sw(env, 'POST', `/Calls/${call.provider_sid}`, { Status: 'completed' }); } catch { /* already ended */ }
     }
     return { ok: true };
   }],
@@ -783,8 +811,8 @@ const ROUTES = [
     const s = await getSettings(env);
     const rec = body.recording_id || call.recording_id || s.default_recording_id;
     if (!rec) throw new ApiError(400, 'Record or upload a voicemail first.');
-    if (!call.twilio_sid || call.kind !== 'auto') throw new ApiError(400, 'Voicemail drop works on calls placed by the dialer.');
-    await tw(env, 'POST', `/Calls/${call.twilio_sid}.json`, { Twiml: `<Response><Play>${esc(`${origin}/audio/${rec}.wav`)}</Play><Hangup/></Response>` });
+    if (!call.provider_sid) throw new ApiError(400, 'That call is not active.');
+    await sw(env, 'POST', `/Calls/${call.provider_sid}`, { Url: hookUrl(origin, s, 'play', { rec }), Method: 'POST' });
     await run(env, 'UPDATE calls SET vm_dropped = 1, recording_id = ? WHERE id = ?', rec, call.id);
     return { ok: true };
   }],

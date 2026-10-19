@@ -1,31 +1,40 @@
 # Outreach Hub
 
-A small GoHighLevel-style outreach tool on **your own Twilio account**:
+A small GoHighLevel-style outreach tool on **your own SignalWire account**:
 
 - **Contacts**: CSV import, tags, statuses, opt-out and do-not-call flags
 - **Inbox**: two-way SMS conversations
 - **SMS campaigns**: merge fields (`{{first_name}}`), background sending, pause/cancel, reply counts, automatic STOP handling
-- **Power dialer**: your browser is the phone. It dials one lead at a time, detects answering machines, and either rings you (a person answered) or plays your recorded **voicemail drop** and moves on. Auto-dial next lead, call script, dispositions, manual "Drop voicemail" button
+- **Power dialer**: dials one lead at a time, detects answering machines, and either connects a person to you or plays your recorded **voicemail drop** and moves on. Auto-dial next lead, call script, dispositions, manual "Drop voicemail" button
 - **Voicemails**: record in the browser or upload a file
-- Calling-hours window, max attempts, DNC list
+- Calling-hours window, max attempts, do-not-call list
 
 ## How it fits together
 
 ```
-GitHub Pages (docs/)  ──────►  Cloudflare Worker (worker/)  ──────►  Twilio
- the UI, static files          holds your Twilio secrets,             SMS + Voice
+GitHub Pages (docs/)  ──────►  Cloudflare Worker (worker/)  ──────►  SignalWire
+ the UI, static files          holds your SignalWire secrets,         SMS + Voice
  no secrets in it              D1 database, webhooks, SMS queue
 ```
 
-GitHub Pages can only serve static files, and Twilio credentials must never sit in browser code, so a tiny backend is required. A Cloudflare Worker is free for this scale and is one file with no dependencies (`worker/src/index.js`).
+GitHub Pages can only serve static files, and SignalWire credentials must never sit in browser code, so a tiny backend is required. A Cloudflare Worker is free at this scale and is one file with no dependencies (`worker/src/index.js`).
+
+### How the dialer reaches you
+You talk on **your own cell phone**. When you press **Start session**, SignalWire calls your phone; answer it and stay on the line. That call sits in a conference. The dialer then places each lead's call with answering-machine detection:
+
+- a **person** answers: they are dropped into your conference and you are talking
+- a **machine** answers: your voicemail plays after the beep and the call ends, and you never hear it
+
+The web page is the control panel (queue, script, notes, outcomes). Mute and volume are on your phone.
 
 ## Set it up (about 20 minutes)
 
-### 1. Twilio
-1. In the Twilio Console, copy your **Account SID** and **Auth Token**.
-2. Buy a phone number with SMS and Voice.
-3. US texting: register for **A2P 10DLC** (Messaging, Regulatory Compliance). Carriers block unregistered marketing texts.
-4. A trial account only reaches verified numbers. Upgrade to message real contacts.
+### 1. SignalWire
+1. Create a project at signalwire.com. Note your **Space name** (the part before `.signalwire.com` in your dashboard URL) and the **Project ID**.
+2. In the project's **API** tab, create a token with the **Voice**, **Messaging** and **Numbers** scopes. Copy it.
+3. Buy a phone number with SMS and Voice. Use one that nothing else points to, because connecting it replaces its webhooks.
+4. US texting: register your brand and campaign (10DLC) in the SignalWire dashboard. Carriers block unregistered marketing texts.
+5. Trial accounts are restricted (typically only verified numbers can be reached). Upgrade before contacting real people.
 
 ### 2. Cloudflare Worker
 
@@ -33,8 +42,8 @@ GitHub Pages can only serve static files, and Twilio credentials must never sit 
 1. Cloudflare dashboard, **Workers & Pages**, **Create**, **Hello World**, name it `outreach-hub`, Deploy, then **Edit code**. Replace everything with the contents of `worker/src/index.js`. Deploy.
 2. **Storage & databases**, **D1**, create a database named `outreach-hub`.
 3. Worker, **Settings**, **Bindings**, **Add**, **D1 database**: variable name `DB`, pick that database.
-4. Worker, **Settings**, **Variables and Secrets**: add secrets `APP_PASSWORD` (choose a long one), `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and a plain variable `ALLOWED_ORIGIN` = `https://YOURNAME.github.io`.
-5. Worker, **Settings**, **Triggers**, **Cron Triggers**: add `* * * * *` (this is what sends campaign texts in the background).
+4. Worker, **Settings**, **Variables and Secrets**: add secrets `APP_PASSWORD` (choose a long one), `SIGNALWIRE_SPACE`, `SIGNALWIRE_PROJECT_ID`, `SIGNALWIRE_API_TOKEN`, and a plain variable `ALLOWED_ORIGIN` = `https://YOURNAME.github.io`.
+5. Worker, **Settings**, **Triggers**, **Cron Triggers**: add `* * * * *` (this sends campaign texts in the background).
 
 **Or with Wrangler:**
 ```bash
@@ -42,8 +51,9 @@ cd worker
 npx wrangler d1 create outreach-hub          # paste the database_id into wrangler.toml
 # edit ALLOWED_ORIGIN in wrangler.toml
 npx wrangler secret put APP_PASSWORD
-npx wrangler secret put TWILIO_ACCOUNT_SID
-npx wrangler secret put TWILIO_AUTH_TOKEN
+npx wrangler secret put SIGNALWIRE_SPACE
+npx wrangler secret put SIGNALWIRE_PROJECT_ID
+npx wrangler secret put SIGNALWIRE_API_TOKEN
 npx wrangler deploy
 ```
 Tables are created automatically on first use. Note your Worker URL (`https://outreach-hub.<you>.workers.dev`).
@@ -52,33 +62,33 @@ Tables are created automatically on first use. Note your Worker URL (`https://ou
 Push this repo to GitHub, then **Settings, Pages, Deploy from a branch, `main`, folder `/docs`**. Your UI is at `https://YOURNAME.github.io/REPO/`.
 
 ### 4. Connect
-Open the page, enter the Worker URL and your `APP_PASSWORD`. Go to **Settings, Load my Twilio numbers, Connect this number**. That one click:
-- points the number's SMS and voice webhooks at your Worker,
-- creates the TwiML App and API key that browser calling needs.
+Open the page, enter the Worker URL and your `APP_PASSWORD`. Go to **Settings**, type **your cell phone number**, **Load my SignalWire numbers**, pick the number, **Connect this number**. That points the number's text and call webhooks at your Worker (each URL carries a private key only your Worker and SignalWire know).
 
 Then import contacts, record a voicemail, and open the Dialer.
 
 ## Using the dialer
 1. **Voicemails**: record or upload your message (20 to 30 seconds works best).
-2. **Dialer**: tick the consent box, **Start session** (allow the microphone), pick a list, **Load queue**.
-3. **Dial**. When a person answers, your browser rings and connects automatically. When a machine answers, the voicemail plays after the beep and the call ends. Turn on **Auto-dial** to roll straight to the next lead.
-4. Tag the outcome (Interested, Call back, Do not call...). Do-not-call and wrong numbers are never dialed again.
+2. **Dialer**: tick the consent box, **Start session**, answer your phone and stay on the line.
+3. Pick a list, **Load queue**, **Dial**. Turn on **Auto-dial** to roll straight to the next lead after each call.
+4. When a person answers you are connected on your phone. Hang up on the lead from the page (or they hang up), then tag the outcome (Interested, Call back, Do not call...). Do-not-call and wrong numbers are never dialed again.
+5. **End session** when you are done, or just hang up your phone.
 
-If their greeting wasn't detected as a machine and you hear it, press **Drop voicemail** to play your recording right away.
+If a greeting was not detected as a machine and you hear it, press **Drop voicemail** to play your recording right away.
 
 ## Things worth knowing
-- **It is not "ringless".** Twilio has no ringless-voicemail feature. The drop is a real call: the phone rings, voicemail picks up, and your recording plays after the beep.
-- **Cost:** voice minutes plus Twilio's answering-machine detection fee per call, and SMS segments. Check Twilio's current pricing.
+- **It is not "ringless".** The drop is a real call: the phone rings, voicemail picks up, and your recording plays after the beep.
+- **Cost:** voice minutes for the lead call, plus the whole time your own phone leg stays open during a session, plus answering-machine detection fees and SMS segments. Check SignalWire's current pricing.
 - **Compliance is on you.** Only text people who opted in. Prerecorded voicemail drops count as calls under US TCPA rules, so you need permission for those numbers and should scrub the Do Not Call registry. STOP replies are honored automatically, and sending and calling are limited to the hours in Settings (default 11 AM to 8 PM Eastern, which sits inside 8 AM to 9 PM in every US time zone).
-- **One agent, one call at a time.** Cloudflare's free plan allows about 20 campaign texts per minute (raise it in Settings on a paid plan). Voicemails are capped at roughly 80 seconds.
-- Passwords and the Worker URL live in your browser's local storage. Sign out in Settings on shared computers.
+- **One person, one call at a time.** Cloudflare's free plan allows about 20 campaign texts per minute (raise it in Settings on a paid plan). Voicemails are capped at roughly 80 seconds.
+- Your password and the Worker URL live in your browser's local storage. Sign out in Settings on shared computers.
+- Not yet verified against live SignalWire: this was built from SignalWire's documentation and tested against a simulator. Do your first calls on your own phone numbers.
 
 ## Trying it without any accounts
 ```bash
 python3 -m http.server 8791
 ```
-- `http://127.0.0.1:8791/test/app.html?seed=1`: the real UI running against the real Worker code with an in-memory database, a fake Twilio and a fake phone.
-- `http://127.0.0.1:8791/test/worker-test.html`: automated checks for the Worker (webhook signatures, STOP handling, campaigns, the voicemail-drop flow, calling hours...).
+- `http://127.0.0.1:8791/test/app.html?seed=1`: the real UI against the real Worker code with an in-memory database and a fake SignalWire. Use the `__sim` helpers in the browser console to play SignalWire's part of a call.
+- `http://127.0.0.1:8791/test/worker-test.html`: automated checks for the Worker (webhook keys, STOP handling, campaigns, the session and voicemail-drop flow, calling hours...).
 
 ## Layout
 ```

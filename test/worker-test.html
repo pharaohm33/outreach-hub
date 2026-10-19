@@ -4,9 +4,9 @@
 <body style="font:14px monospace;white-space:pre-wrap"><div id="out"></div>
 <script src="https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/sql-wasm.js"></script>
 <script type="module">
-import { createBackend, WORKER_ORIGIN, PASSWORD, AUTH_TOKEN } from './fake-backend.js';
+import { createBackend, WORKER_ORIGIN, PASSWORD } from './fake-backend.js';
 import worker from '../worker/src/index.js';
-const { normPhone, validSignature, inWindow } = worker.__test;
+const { normPhone, inWindow } = worker.__test;
 
 const out = document.getElementById('out');
 let pass = 0, fail = 0;
@@ -16,6 +16,7 @@ const call = async (method, path, body) => {
   const r = await fetch(WORKER_ORIGIN + '/api' + path, { method, headers: { Authorization: 'Bearer ' + PASSWORD, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
   return { status: r.status, data: await r.json().catch(() => null) };
 };
+const sw = (path) => be.swLog.filter((l) => l.path === path);
 
 try {
   // phone normalising
@@ -24,29 +25,33 @@ try {
   t('normPhone intl', normPhone('+44 20 7946 0958') === '+442079460958');
   t('normPhone junk', normPhone('12345') === null);
 
-  // Twilio's documented signature example
-  const sigEnv = { TWILIO_AUTH_TOKEN: '12345' };
-  const ok = await validSignature(sigEnv, 'https://mycompany.com/myapp.php?foo=1&bar=2',
-    { CallSid: 'CA1234567890ABCDE', Caller: '+14158675310', Digits: '1234', From: '+14158675310', To: '+18005551212' }, 'GvWf1cFY/Q7PnoempGyD5oXAezc=');
-  t('Twilio signature test vector', ok === true);
-
   // auth
   let r = await fetch(WORKER_ORIGIN + '/api/status', { headers: { Authorization: 'Bearer nope' } });
   t('wrong password -> 401', r.status === 401);
   r = await call('GET', '/status');
-  t('status ok', r.status === 200 && r.data.twilio_configured === true && r.data.voice_ready === false, r);
+  t('status ok', r.status === 200 && r.data.configured === true && r.data.voice_ready === false && r.data.settings.webhook_key === undefined && r.data.settings.session_sid === undefined, r);
 
   // setup
-  r = await call('GET', '/twilio/numbers');
-  t('numbers list', r.data?.[0]?.phone_number === '+14155550100', r);
+  r = await call('GET', '/numbers');
+  t('numbers list', r.data?.[0]?.phone_number === '+14155550100' && r.data[0].sid === 'PN1', r);
   r = await call('POST', '/setup', { phone_sid: 'PN1', phone_number: '+14155550100' });
+  t('setup needs your phone', r.status === 400, r);
+  r = await call('POST', '/setup', { phone_sid: 'PN1', phone_number: '+14155550100', agent_phone: '(650) 555-0199' });
   t('setup ok', r.status === 200 && r.data.ok, r);
-  r = await call('POST', '/voice/token');
-  const parts = r.data.token.split('.');
-  const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
-  t('token has voice grants', payload.grants.voice.outgoing.application_sid === 'APtest' && payload.iss === 'SKtest' && payload.grants.identity === 'agent', payload);
+  const hooks = sw('/IncomingPhoneNumbers/PN1').pop().params;
+  t('number webhooks set with secret key', /\/hook\/sms\?k=[0-9a-f]{48}$/.test(hooks.SmsUrl) && /\/hook\/inbound-call\?k=/.test(hooks.VoiceUrl), hooks);
+  r = await call('GET', '/status');
+  t('voice ready after setup', r.data.voice_ready === true && r.data.settings.agent_phone === '+16505550199', r.data);
   r = await call('PUT', '/settings', { window_start: 0, window_end: 24, timezone: 'America/New_York' });
-  t('settings save', r.data.window_end === 24 && r.data.api_key_secret === undefined, r);
+  t('settings save', r.data.window_end === 24 && r.data.webhook_key === undefined, r);
+  r = await call('PUT', '/settings', { agent_phone: 'abc' });
+  t('bad phone rejected', r.status === 400, r);
+
+  // webhook auth
+  let hook = await be.webhook('/hook/sms', { From: '+14155559999', Body: 'x' }, { key: false });
+  t('webhook without key -> 403', hook.status === 403, hook);
+  hook = await be.webhook('/hook/sms', { From: '+14155559999', Body: 'x' }, { key: 'wrong' });
+  t('webhook wrong key -> 403', hook.status === 403, hook);
 
   // contacts
   r = await call('POST', '/contacts/import', { tags: ['Lead'], contacts: [
@@ -71,50 +76,44 @@ try {
 
   // direct SMS
   r = await call('POST', `/contacts/${ann.id}/messages`, { body: 'Hi Ann' });
-  t('send sms', r.data.status === 'sent' && r.data.twilio_sid?.startsWith('SM'), r);
-  const smsCall = be.twilioLog.filter((l) => l.path === '/Messages.json').pop();
-  t('sms params', smsCall.params.To === '+14155550101' && smsCall.params.From === '+14155550100' && smsCall.params.StatusCallback.endsWith('/twilio/sms-status'), smsCall);
-  let hook = await be.webhook('/twilio/sms-status', { MessageSid: r.data.twilio_sid, MessageStatus: 'delivered' });
+  t('send sms', r.data.status === 'sent' && r.data.provider_sid?.startsWith('SM'), r);
+  const smsCall = sw('/Messages').pop();
+  t('sms params', smsCall.params.To === '+14155550101' && smsCall.params.From === '+14155550100' && /\/hook\/sms-status\?k=/.test(smsCall.params.StatusCallback), smsCall);
+  hook = await be.webhook('/hook/sms-status', { MessageSid: r.data.provider_sid, MessageStatus: 'delivered' });
   t('status webhook', hook.status === 204, hook);
-  hook = await be.webhook('/twilio/sms-status', { MessageSid: r.data.twilio_sid, MessageStatus: 'sent' });
+  hook = await be.webhook('/hook/sms-status', { MessageSid: r.data.provider_sid, MessageStatus: 'sent' });
   r = await call('GET', `/contacts/${ann.id}/messages`);
   t('delivered not downgraded', r.data.messages[0].status === 'delivered', r.data.messages);
 
-  // bad signature
-  r = await fetch(WORKER_ORIGIN + '/twilio/sms', { method: 'POST', body: new URLSearchParams({ From: '+14155550101', Body: 'x' }), headers: { 'X-Twilio-Signature': 'bad' } });
-  t('bad signature -> 403', r.status === 403);
-
   // inbound + opt out
-  hook = await be.webhook('/twilio/sms', { From: '+14155550101', To: '+14155550100', Body: 'yes please', MessageSid: 'SMin1' });
-  t('inbound sms twiml', hook.status === 200 && hook.text.includes('<Response>'), hook);
+  hook = await be.webhook('/hook/sms', { From: '+14155550101', To: '+14155550100', Body: 'yes please', MessageSid: 'SMin1' });
+  t('inbound sms cxml', hook.status === 200 && hook.text.includes('<Response>') && !hook.text.includes('<Message>'), hook);
   r = await call('GET', '/conversations');
   t('conversation unread', r.data[0].unread === 1 && r.data[0].last_body === 'yes please', r.data);
   await call('POST', `/contacts/${ann.id}/read`);
-  hook = await be.webhook('/twilio/sms', { From: '+14155550102', Body: 'STOP', MessageSid: 'SMin2' });
+  hook = await be.webhook('/hook/sms', { From: '+14155550102', Body: 'STOP', MessageSid: 'SMin2' });
+  t('STOP gets a confirmation', hook.text.includes('<Message>You have been unsubscribed'), hook);
   r = await call('GET', '/contacts?q=0102');
   const bob = r.data.contacts[0];
   t('STOP opts out', bob.sms_opt_out === 1, bob);
   r = await call('POST', `/contacts/${bob.id}/messages`, { body: 'hello' });
   t('send to opted-out blocked', r.status === 400, r);
-  hook = await be.webhook('/twilio/sms', { From: '+16505550999', Body: 'who is this', MessageSid: 'SMin3' });
+  hook = await be.webhook('/hook/sms', { From: '+16505550999', Body: 'who is this', MessageSid: 'SMin3' });
   r = await call('GET', '/contacts?tag=inbound');
   t('unknown sender becomes contact', r.data.total === 1);
 
   // campaign
   r = await call('POST', '/campaigns', { name: 'Promo', body: 'Hey {{first_name}}, from {{company}}!', tag: 'lead' });
-  t('campaign created (opted-out + empty skipped)', r.status === 200 && r.data.total === 2, r); // Ann + Stop (Bob opted out)
-  const cid = r.data.id;
+  t('campaign created (opted-out skipped)', r.status === 200 && r.data.total === 2, r);
   r = await call('POST', '/sms/process');
   t('queue processed: 1 sent, 1 failed(21610)', r.data.sent === 1 && r.data.failed === 1, r);
-  const sent = be.twilioLog.filter((l) => l.path === '/Messages.json').slice(-2).map((l) => l.params.Body);
+  const sent = sw('/Messages').slice(-2).map((l) => l.params.Body);
   t('merge fields + footer', sent.some((b) => b.startsWith('Hey Ann, from Acme!') && b.includes('Reply STOP')), sent);
   t('empty company fallback', sent.some((b) => b.startsWith('Hey Stop, from !')), sent);
   r = await call('GET', '/campaigns');
   t('campaign done with stats', r.data[0].status === 'done' && r.data[0].sent === 1 && r.data[0].failed === 1, r.data[0]);
   r = await call('GET', '/contacts?q=5550000000');
   t('21610 marks opt-out', r.data.contacts[0]?.sms_opt_out === 1, r.data);
-
-  // pause
   r = await call('POST', '/campaigns', { name: 'P2', body: 'again', tag: 'vip' });
   await call('POST', `/campaigns/${r.data.id}/pause`);
   r = await call('POST', '/sms/process');
@@ -129,33 +128,56 @@ try {
   r = await call('GET', '/settings');
   t('first recording becomes default', r.data.default_recording_id === rec);
 
-  // dialer
+  // dialer: needs a session first
   r = await call('GET', '/dialer/queue');
-  t('queue excludes nothing yet', r.data.total >= 3, r.data.total);
+  t('queue lists contacts', r.data.total >= 3, r.data.total);
   r = await call('POST', '/dialer/call', { contact_id: ann.id, auto_vm: true });
-  t('call placed', r.status === 200 && r.data.call.twilio_sid?.startsWith('CA'), r);
+  t('call blocked without a session', r.status === 400 && /session/i.test(r.data.error), r);
+
+  r = await call('POST', '/dialer/session/start');
+  t('session ringing', r.status === 200 && r.data.status === 'ringing', r);
+  const sessionCall = sw('/Calls').pop();
+  t('session calls your phone', sessionCall.params.To === '+16505550199' && sessionCall.params.From === '+14155550100' && /\/hook\/agent-answer\?k=/.test(sessionCall.params.Url), sessionCall);
+  const agentSid = sessionCall.sid;
+  hook = await be.webhook('/hook/agent-answer', { CallSid: 'CAother' });
+  t('agent-answer ignores unknown call', hook.text.includes('<Hangup/>'), hook);
+  hook = await be.webhook('/hook/agent-answer', { CallSid: agentSid });
+  t('agent parked in conference', /<Conference[^>]*startConferenceOnEnter="true"[^>]*endConferenceOnExit="true"/.test(hook.text), hook);
+  const confName = /waitUrl="">([^<]+)</.exec(hook.text)[1];
+  r = await call('GET', '/dialer/session');
+  t('session active', r.data.status === 'active', r);
+
+  // call 1: voicemail
+  r = await call('POST', '/dialer/call', { contact_id: ann.id, auto_vm: true });
+  t('call placed', r.status === 200 && r.data.call.provider_sid?.startsWith('CA'), r);
   const callId = r.data.call.id;
-  const placed = be.twilioLog.filter((l) => l.path === '/Calls.json').pop().params;
-  t('AMD params', placed.MachineDetection === 'DetectMessageEnd' && placed.Url.includes(`/twilio/lead-answer?call=${callId}`) && placed.From === '+14155550100', placed);
-  // voicemail answers
-  hook = await be.webhook(`/twilio/lead-answer?call=${callId}`, { CallSid: 'CAx', AnsweredBy: 'machine_end_beep' });
+  const placed = sw('/Calls').pop().params;
+  t('AMD params', placed.MachineDetection === 'DetectMessageEnd' && placed.To === '+14155550101' && placed.Url.includes('/hook/lead-answer?k=') && placed.Url.endsWith(`&call=${callId}`) && placed.From === '+14155550100', placed);
+  hook = await be.webhook(`/hook/lead-answer?call=${callId}`, { CallSid: 'CAx', AnsweredBy: 'machine_end_beep' });
   t('machine -> Play recording', hook.text.includes(`<Play>${WORKER_ORIGIN}/audio/${rec}.wav</Play>`) && hook.text.includes('<Hangup/>'), hook.text);
-  hook = await be.webhook(`/twilio/call-status?call=${callId}`, { CallStatus: 'completed', CallDuration: '27' });
+  hook = await be.webhook(`/hook/call-status?call=${callId}`, { CallStatus: 'completed', CallDuration: '27' });
   r = await call('GET', `/calls/${callId}`);
-  t('call recorded as vm drop', r.data.vm_dropped === 1 && r.data.disposition === 'voicemail_dropped' && r.data.duration === 27, r.data);
+  t('call recorded as vm drop', r.data.vm_dropped === 1 && r.data.disposition === 'voicemail_dropped' && r.data.duration === 27 && !r.data.connected_at, r.data);
   r = await call('GET', `/contacts?q=Ann`);
   t('contact marked voicemailed', r.data.contacts[0].status === 'voicemailed' && r.data.contacts[0].call_attempts === 1, r.data.contacts[0]);
   r = await call('GET', '/dialer/queue');
   t('recently called excluded from queue', !r.data.contacts.some((c) => c.id === ann.id), r.data.contacts.map((c) => c.id));
 
-  // human answers
+  // call 2: human is dropped into your conference
   r = await call('POST', '/dialer/call', { contact_id: bob.id, auto_vm: false });
   const c2 = r.data.call.id;
-  hook = await be.webhook(`/twilio/lead-answer?call=${c2}`, { AnsweredBy: 'human' });
-  t('human -> Dial client agent', hook.text.includes('<Client>agent</Client>') && hook.text.includes('answerOnBridge'), hook.text);
+  hook = await be.webhook(`/hook/lead-answer?call=${c2}`, { AnsweredBy: 'human' });
+  t('human -> your conference', new RegExp(`<Conference[^>]*startConferenceOnEnter="false"[^>]*endConferenceOnExit="false"[^>]*>${confName}<`).test(hook.text), hook.text);
+  r = await call('GET', `/calls/${c2}`);
+  t('connected_at set', !!r.data.connected_at && r.data.answered_by === 'human', r.data);
+  const leadSid = sw('/Calls').slice(-1)[0].sid;
   r = await call('POST', `/calls/${c2}/voicemail`, {});
-  t('manual vm drop needs recording?', r.status === 200, r); // default recording exists
-  t('manual drop sends Twiml', be.twilioLog.filter((l) => /Calls\/CA/.test(l.path)).pop().params.Twiml.includes('<Play>'));
+  const redirect = sw(`/Calls/${leadSid}`).pop().params;
+  t('manual vm drop redirects the lead call', r.status === 200 && /\/hook\/play\?k=[0-9a-f]+&rec=/.test(redirect.Url), redirect);
+  hook = await be.webhook(`/hook/play?rec=${rec}`, {});
+  t('play hook returns audio', hook.text.includes(`<Play>${WORKER_ORIGIN}/audio/${rec}.wav</Play>`), hook.text);
+  r = await call('POST', `/calls/${c2}/hangup`);
+  t('hangup sends Status=completed', sw(`/Calls/${leadSid}`).pop().params.Status === 'completed', r);
   r = await call('POST', `/calls/${c2}/disposition`, { disposition: 'interested', notes: 'wants a demo' });
   r = await call('GET', '/contacts?q=0102');
   t('disposition updates contact', r.data.contacts[0].status === 'interested' && r.data.contacts[0].notes.includes('demo'), r.data.contacts[0]);
@@ -163,14 +185,33 @@ try {
   r = await call('GET', '/contacts?q=0102');
   t('soft disposition keeps real outcome', r.data.contacts[0].status === 'interested', r.data.contacts[0]);
 
-  // DNC
+  // lead answers after your phone hung up
+  hook = await be.webhook('/hook/agent-status', { CallSid: agentSid, CallStatus: 'completed' });
+  r = await call('GET', '/dialer/session');
+  t('session ended by your hangup', r.data.status === 'ended', r);
+  const cy = (await call('GET', '/contacts?q=5550102')).data.contacts[0];
+  const ann2 = (await call('GET', '/contacts?q=Ann')).data.contacts[0];
+  r = await call('POST', '/dialer/call', { contact_id: ann2.id, auto_vm: true });
+  t('no calls while session is over', r.status === 400, r);
+
+  // restart a session, DNC + hours
+  r = await call('POST', '/dialer/session/start');
+  const sid2 = sw('/Calls').pop().sid;
+  await be.webhook('/hook/agent-answer', { CallSid: sid2 });
   r = await call('POST', '/dialer/call', { contact_id: ann.id, auto_vm: true });
   const c3 = r.data.call.id;
+  hook = await be.webhook(`/hook/lead-answer?call=${c3}`, { AnsweredBy: 'human' });
   await call('POST', `/calls/${c3}/disposition`, { disposition: 'dnc' });
   r = await call('POST', '/dialer/call', { contact_id: ann.id, auto_vm: true });
   t('DNC blocks calls', r.status === 400 && /do-not-call/.test(r.data.error), r);
 
-  // calling hours
+  r = await call('POST', '/dialer/session/end');
+  t('session end hangs up your phone', r.data.status === 'ended' && sw(`/Calls/${sid2}`).pop().params.Status === 'completed', r);
+  hook = await be.webhook(`/hook/lead-answer?call=${c3}`, { AnsweredBy: 'human' });
+  t('human with no session gets a polite hangup', hook.text.includes('<Say>') && hook.text.includes('<Hangup/>') && !hook.text.includes('Conference'), hook.text);
+
+  await call('POST', '/dialer/session/start');
+  await be.webhook('/hook/agent-answer', { CallSid: sw('/Calls').pop().sid });
   await call('PUT', '/settings', { window_start: 3, window_end: 3 });
   r = await call('POST', '/dialer/call', { contact_id: bob.id, auto_vm: false });
   t('outside hours blocked', r.status === 400 && /calling hours/.test(r.data.error), r);
@@ -178,12 +219,15 @@ try {
   r = await call('POST', '/sms/process');
   t('SMS queue honours hours', r.data.skipped === 'outside_hours', r);
 
+  // inbound call forwards to your phone
+  hook = await be.webhook('/hook/inbound-call', { From: '+14155550101' });
+  t('inbound call rings your phone', hook.text.includes('<Dial timeout="20">+16505550199</Dial>'), hook.text);
+
   r = await call('GET', '/stats');
   t('stats', r.data.contacts === 4 && r.data.voicemails >= 1 && r.data.sms_sent >= 1, r.data);
   r = await call('GET', '/calls');
   t('calls log', r.data.length >= 3 && r.data[0].first_name !== undefined, r.data.length);
 
-  // delete
   r = await call('POST', '/contacts/bulk', { ids: [bob.id], action: 'delete' });
   r = await call('GET', '/contacts');
   t('bulk delete', !r.data.contacts.some((c) => c.id === bob.id));
