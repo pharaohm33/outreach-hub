@@ -1,0 +1,196 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Worker tests</title>
+<body style="font:14px monospace;white-space:pre-wrap"><div id="out"></div>
+<script src="https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/sql-wasm.js"></script>
+<script type="module">
+import { createBackend, WORKER_ORIGIN, PASSWORD, AUTH_TOKEN } from './fake-backend.js';
+import worker from '../worker/src/index.js';
+const { normPhone, validSignature, inWindow } = worker.__test;
+
+const out = document.getElementById('out');
+let pass = 0, fail = 0;
+const t = (name, cond, extra) => { cond ? pass++ : fail++; out.textContent += `${cond ? 'PASS' : 'FAIL'}  ${name}${cond ? '' : '  -> ' + JSON.stringify(extra)}\n`; };
+const be = await createBackend();
+const call = async (method, path, body) => {
+  const r = await fetch(WORKER_ORIGIN + '/api' + path, { method, headers: { Authorization: 'Bearer ' + PASSWORD, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  return { status: r.status, data: await r.json().catch(() => null) };
+};
+
+try {
+  // phone normalising
+  t('normPhone 10 digits', normPhone('(415) 555-2671') === '+14155552671');
+  t('normPhone 11 digits', normPhone('1 415 555 2671') === '+14155552671');
+  t('normPhone intl', normPhone('+44 20 7946 0958') === '+442079460958');
+  t('normPhone junk', normPhone('12345') === null);
+
+  // Twilio's documented signature example
+  const sigEnv = { TWILIO_AUTH_TOKEN: '12345' };
+  const ok = await validSignature(sigEnv, 'https://mycompany.com/myapp.php?foo=1&bar=2',
+    { CallSid: 'CA1234567890ABCDE', Caller: '+14158675310', Digits: '1234', From: '+14158675310', To: '+18005551212' }, 'GvWf1cFY/Q7PnoempGyD5oXAezc=');
+  t('Twilio signature test vector', ok === true);
+
+  // auth
+  let r = await fetch(WORKER_ORIGIN + '/api/status', { headers: { Authorization: 'Bearer nope' } });
+  t('wrong password -> 401', r.status === 401);
+  r = await call('GET', '/status');
+  t('status ok', r.status === 200 && r.data.twilio_configured === true && r.data.voice_ready === false, r);
+
+  // setup
+  r = await call('GET', '/twilio/numbers');
+  t('numbers list', r.data?.[0]?.phone_number === '+14155550100', r);
+  r = await call('POST', '/setup', { phone_sid: 'PN1', phone_number: '+14155550100' });
+  t('setup ok', r.status === 200 && r.data.ok, r);
+  r = await call('POST', '/voice/token');
+  const parts = r.data.token.split('.');
+  const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+  t('token has voice grants', payload.grants.voice.outgoing.application_sid === 'APtest' && payload.iss === 'SKtest' && payload.grants.identity === 'agent', payload);
+  r = await call('PUT', '/settings', { window_start: 0, window_end: 24, timezone: 'America/New_York' });
+  t('settings save', r.data.window_end === 24 && r.data.api_key_secret === undefined, r);
+
+  // contacts
+  r = await call('POST', '/contacts/import', { tags: ['Lead'], contacts: [
+    { first_name: 'Ann', last_name: 'Lee', phone: '(415) 555-0101', company: 'Acme', tags: 'vip' },
+    { first_name: 'Bob', phone: '415-555-0102' },
+    { first_name: 'Dup', phone: '4155550102', email: 'b@x.com' },
+    { first_name: 'Bad', phone: '123' },
+    { first_name: 'Stop', phone: '5550000000' },
+  ] });
+  t('import counts', r.data.added === 3 && r.data.invalid === 1, r);
+  r = await call('GET', '/contacts?tag=lead');
+  t('tag filter', r.data.total === 3 && r.data.contacts.find((c) => c.phone === '+14155550102').email === 'b@x.com', r);
+  const ann = r.data.contacts.find((c) => c.first_name === 'Ann');
+  t('tags merged', ann.tags.includes('vip') && ann.tags.includes('lead'), ann);
+  r = await call('GET', '/contacts?q=acme');
+  t('search', r.data.total === 1);
+  r = await call('POST', '/contacts/bulk', { ids: [ann.id], action: 'add_tag', tag: 'Hot' });
+  r = await call('GET', '/tags');
+  t('tags list', r.data.includes('hot') && r.data.includes('vip'), r);
+  r = await call('POST', '/contacts', { phone: '415-555-0102' });
+  t('dup create rejected', r.status === 400);
+
+  // direct SMS
+  r = await call('POST', `/contacts/${ann.id}/messages`, { body: 'Hi Ann' });
+  t('send sms', r.data.status === 'sent' && r.data.twilio_sid?.startsWith('SM'), r);
+  const smsCall = be.twilioLog.filter((l) => l.path === '/Messages.json').pop();
+  t('sms params', smsCall.params.To === '+14155550101' && smsCall.params.From === '+14155550100' && smsCall.params.StatusCallback.endsWith('/twilio/sms-status'), smsCall);
+  let hook = await be.webhook('/twilio/sms-status', { MessageSid: r.data.twilio_sid, MessageStatus: 'delivered' });
+  t('status webhook', hook.status === 204, hook);
+  hook = await be.webhook('/twilio/sms-status', { MessageSid: r.data.twilio_sid, MessageStatus: 'sent' });
+  r = await call('GET', `/contacts/${ann.id}/messages`);
+  t('delivered not downgraded', r.data.messages[0].status === 'delivered', r.data.messages);
+
+  // bad signature
+  r = await fetch(WORKER_ORIGIN + '/twilio/sms', { method: 'POST', body: new URLSearchParams({ From: '+14155550101', Body: 'x' }), headers: { 'X-Twilio-Signature': 'bad' } });
+  t('bad signature -> 403', r.status === 403);
+
+  // inbound + opt out
+  hook = await be.webhook('/twilio/sms', { From: '+14155550101', To: '+14155550100', Body: 'yes please', MessageSid: 'SMin1' });
+  t('inbound sms twiml', hook.status === 200 && hook.text.includes('<Response>'), hook);
+  r = await call('GET', '/conversations');
+  t('conversation unread', r.data[0].unread === 1 && r.data[0].last_body === 'yes please', r.data);
+  await call('POST', `/contacts/${ann.id}/read`);
+  hook = await be.webhook('/twilio/sms', { From: '+14155550102', Body: 'STOP', MessageSid: 'SMin2' });
+  r = await call('GET', '/contacts?q=0102');
+  const bob = r.data.contacts[0];
+  t('STOP opts out', bob.sms_opt_out === 1, bob);
+  r = await call('POST', `/contacts/${bob.id}/messages`, { body: 'hello' });
+  t('send to opted-out blocked', r.status === 400, r);
+  hook = await be.webhook('/twilio/sms', { From: '+16505550999', Body: 'who is this', MessageSid: 'SMin3' });
+  r = await call('GET', '/contacts?tag=inbound');
+  t('unknown sender becomes contact', r.data.total === 1);
+
+  // campaign
+  r = await call('POST', '/campaigns', { name: 'Promo', body: 'Hey {{first_name}}, from {{company}}!', tag: 'lead' });
+  t('campaign created (opted-out + empty skipped)', r.status === 200 && r.data.total === 2, r); // Ann + Stop (Bob opted out)
+  const cid = r.data.id;
+  r = await call('POST', '/sms/process');
+  t('queue processed: 1 sent, 1 failed(21610)', r.data.sent === 1 && r.data.failed === 1, r);
+  const sent = be.twilioLog.filter((l) => l.path === '/Messages.json').slice(-2).map((l) => l.params.Body);
+  t('merge fields + footer', sent.some((b) => b.startsWith('Hey Ann, from Acme!') && b.includes('Reply STOP')), sent);
+  t('empty company fallback', sent.some((b) => b.startsWith('Hey Stop, from !')), sent);
+  r = await call('GET', '/campaigns');
+  t('campaign done with stats', r.data[0].status === 'done' && r.data[0].sent === 1 && r.data[0].failed === 1, r.data[0]);
+  r = await call('GET', '/contacts?q=5550000000');
+  t('21610 marks opt-out', r.data.contacts[0]?.sms_opt_out === 1, r.data);
+
+  // pause
+  r = await call('POST', '/campaigns', { name: 'P2', body: 'again', tag: 'vip' });
+  await call('POST', `/campaigns/${r.data.id}/pause`);
+  r = await call('POST', '/sms/process');
+  t('paused campaign not sent', r.data.sent === 0, r);
+
+  // recordings
+  r = await call('POST', '/recordings', { name: 'VM1', mime: 'audio/wav', data: btoa('RIFFxxxxWAVE'), seconds: 12 });
+  const rec = r.data.id;
+  t('recording saved', !!rec);
+  let audio = await fetch(`${WORKER_ORIGIN}/audio/${rec}.wav`);
+  t('audio served', audio.status === 200 && (await audio.text()) === 'RIFFxxxxWAVE');
+  r = await call('GET', '/settings');
+  t('first recording becomes default', r.data.default_recording_id === rec);
+
+  // dialer
+  r = await call('GET', '/dialer/queue');
+  t('queue excludes nothing yet', r.data.total >= 3, r.data.total);
+  r = await call('POST', '/dialer/call', { contact_id: ann.id, auto_vm: true });
+  t('call placed', r.status === 200 && r.data.call.twilio_sid?.startsWith('CA'), r);
+  const callId = r.data.call.id;
+  const placed = be.twilioLog.filter((l) => l.path === '/Calls.json').pop().params;
+  t('AMD params', placed.MachineDetection === 'DetectMessageEnd' && placed.Url.includes(`/twilio/lead-answer?call=${callId}`) && placed.From === '+14155550100', placed);
+  // voicemail answers
+  hook = await be.webhook(`/twilio/lead-answer?call=${callId}`, { CallSid: 'CAx', AnsweredBy: 'machine_end_beep' });
+  t('machine -> Play recording', hook.text.includes(`<Play>${WORKER_ORIGIN}/audio/${rec}.wav</Play>`) && hook.text.includes('<Hangup/>'), hook.text);
+  hook = await be.webhook(`/twilio/call-status?call=${callId}`, { CallStatus: 'completed', CallDuration: '27' });
+  r = await call('GET', `/calls/${callId}`);
+  t('call recorded as vm drop', r.data.vm_dropped === 1 && r.data.disposition === 'voicemail_dropped' && r.data.duration === 27, r.data);
+  r = await call('GET', `/contacts?q=Ann`);
+  t('contact marked voicemailed', r.data.contacts[0].status === 'voicemailed' && r.data.contacts[0].call_attempts === 1, r.data.contacts[0]);
+  r = await call('GET', '/dialer/queue');
+  t('recently called excluded from queue', !r.data.contacts.some((c) => c.id === ann.id), r.data.contacts.map((c) => c.id));
+
+  // human answers
+  r = await call('POST', '/dialer/call', { contact_id: bob.id, auto_vm: false });
+  const c2 = r.data.call.id;
+  hook = await be.webhook(`/twilio/lead-answer?call=${c2}`, { AnsweredBy: 'human' });
+  t('human -> Dial client agent', hook.text.includes('<Client>agent</Client>') && hook.text.includes('answerOnBridge'), hook.text);
+  r = await call('POST', `/calls/${c2}/voicemail`, {});
+  t('manual vm drop needs recording?', r.status === 200, r); // default recording exists
+  t('manual drop sends Twiml', be.twilioLog.filter((l) => /Calls\/CA/.test(l.path)).pop().params.Twiml.includes('<Play>'));
+  r = await call('POST', `/calls/${c2}/disposition`, { disposition: 'interested', notes: 'wants a demo' });
+  r = await call('GET', '/contacts?q=0102');
+  t('disposition updates contact', r.data.contacts[0].status === 'interested' && r.data.contacts[0].notes.includes('demo'), r.data.contacts[0]);
+  r = await call('POST', `/calls/${c2}/disposition`, { disposition: 'no_answer' });
+  r = await call('GET', '/contacts?q=0102');
+  t('soft disposition keeps real outcome', r.data.contacts[0].status === 'interested', r.data.contacts[0]);
+
+  // DNC
+  r = await call('POST', '/dialer/call', { contact_id: ann.id, auto_vm: true });
+  const c3 = r.data.call.id;
+  await call('POST', `/calls/${c3}/disposition`, { disposition: 'dnc' });
+  r = await call('POST', '/dialer/call', { contact_id: ann.id, auto_vm: true });
+  t('DNC blocks calls', r.status === 400 && /do-not-call/.test(r.data.error), r);
+
+  // calling hours
+  await call('PUT', '/settings', { window_start: 3, window_end: 3 });
+  r = await call('POST', '/dialer/call', { contact_id: bob.id, auto_vm: false });
+  t('outside hours blocked', r.status === 400 && /calling hours/.test(r.data.error), r);
+  t('inWindow fn', inWindow({ timezone: 'America/New_York', window_start: 11, window_end: 20 }, new Date('2025-01-15T17:00:00Z')) === true && inWindow({ timezone: 'America/New_York', window_start: 11, window_end: 20 }, new Date('2025-01-15T06:00:00Z')) === false);
+  r = await call('POST', '/sms/process');
+  t('SMS queue honours hours', r.data.skipped === 'outside_hours', r);
+
+  r = await call('GET', '/stats');
+  t('stats', r.data.contacts === 4 && r.data.voicemails >= 1 && r.data.sms_sent >= 1, r.data);
+  r = await call('GET', '/calls');
+  t('calls log', r.data.length >= 3 && r.data[0].first_name !== undefined, r.data.length);
+
+  // delete
+  r = await call('POST', '/contacts/bulk', { ids: [bob.id], action: 'delete' });
+  r = await call('GET', '/contacts');
+  t('bulk delete', !r.data.contacts.some((c) => c.id === bob.id));
+} catch (e) {
+  fail++;
+  out.textContent += 'EXCEPTION ' + (e.stack || e) + '\n';
+}
+out.textContent += `\n${pass} passed, ${fail} failed\n`;
+document.title = fail ? 'FAILED' : 'ALL PASSED';
+</script>

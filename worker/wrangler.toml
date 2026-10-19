@@ -1,0 +1,21 @@
+name = "outreach-hub"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+[vars]
+# Your GitHub Pages origin only: no path, no trailing slash. Several: comma separated.
+ALLOWED_ORIGIN = "https://YOURNAME.github.io"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "outreach-hub"
+database_id = "PASTE_ID_FROM_wrangler_d1_create"
+
+# Sends queued campaign texts every minute.
+[triggers]
+crons = ["* * * * *"]
+
+# Secrets are NOT stored here. Add them with:
+#   npx wrangler secret put APP_PASSWORD
+#   npx wrangler secret put TWILIO_ACCOUNT_SID
+#   npx wrangler secret put TWILIO_AUTH_TOKEN

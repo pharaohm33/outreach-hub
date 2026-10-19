@@ -1,0 +1,53 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Outreach Hub (demo harness)</title>
+<body>Loading demo&hellip;
+<script src="https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/sql-wasm.js"></script>
+<script type="module">
+// Runs the real UI against the real Worker code, an in-memory database, a fake Twilio and a fake
+// browser phone. Handy for trying the app without any accounts. Open: /test/app.html
+import { createBackend, WORKER_ORIGIN, PASSWORD } from './fake-backend.js';
+
+window.__be = await createBackend();
+
+class FakeCall {
+  constructor(params = {}) { this.parameters = params; this.h = {}; this.muted = false; this.state = 'pending'; }
+  on(ev, fn) { (this.h[ev] ||= []).push(fn); return this; }
+  emit(ev, ...a) { (this.h[ev] || []).forEach((f) => f(...a)); }
+  accept() { this.state = 'open'; setTimeout(() => this.emit('accept'), 10); }
+  reject() { this.state = 'rejected'; }
+  mute(m) { this.muted = m; }
+  disconnect() { this.state = 'closed'; setTimeout(() => this.emit('disconnect'), 10); }
+}
+class FakeDevice {
+  constructor(token) { this.token = token; this.h = {}; window.__device = this; }
+  on(ev, fn) { (this.h[ev] ||= []).push(fn); return this; }
+  emit(ev, ...a) { (this.h[ev] || []).forEach((f) => f(...a)); }
+  async register() { setTimeout(() => this.emit('registered'), 30); }
+  async connect({ params }) { return (window.__lastCall = new FakeCall(params)); }
+  destroy() { this.destroyed = true; }
+  updateToken() {}
+  ring(from = '+14155550101') { const c = (window.__lastCall = new FakeCall({ From: from })); this.emit('incoming', c); return c; }
+}
+window.Twilio = { Device: FakeDevice };
+Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia: async () => ({ getTracks: () => [] }) } });
+
+// ?seed=1 pre-fills a connected number, contacts and a voicemail so the screens have something to show.
+if (new URLSearchParams(location.search).has('seed')) {
+  const call = (m, p, b) => fetch(WORKER_ORIGIN + '/api' + p, { method: m, headers: { Authorization: 'Bearer ' + PASSWORD, 'content-type': 'application/json' }, body: b && JSON.stringify(b) });
+  await call('POST', '/setup', { phone_sid: 'PN1', phone_number: '+14155550100' });
+  await call('PUT', '/settings', { window_start: 0, window_end: 24, call_script: 'Hi {{first_name}}, this is Sam. Do you have a minute?' });
+  await call('POST', '/contacts/import', { tags: ['subscribers'], contacts: [
+    { first_name: 'Ann', last_name: 'Lee', phone: '4155550101', company: 'Acme', email: 'ann@example.com' },
+    { first_name: 'Bob', last_name: 'Ray', phone: '4155550102', company: 'Globex' },
+    { first_name: 'Cy', last_name: 'Doe', phone: '4155550103' },
+  ] });
+  await call('POST', '/recordings', { name: 'October intro', mime: 'audio/wav', data: btoa('RIFFxxxxWAVE'), seconds: 24 });
+}
+
+localStorage.setItem('outreach-hub.config', JSON.stringify({ url: WORKER_ORIGIN, password: PASSWORD }));
+const html = await (await fetch('/docs/index.html')).text();
+document.open();
+document.write(html.replace('<head>', '<head><base href="/docs/">'));
+document.close();
+</script>

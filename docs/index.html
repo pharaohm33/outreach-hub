@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Outreach Hub</title>
+<meta name="description" content="SMS outreach, power dialer and voicemail drops on your own Twilio account.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232f5bea'/%3E%3Cpath d='M9 11h14v8H15l-4 4v-4H9z' fill='white'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="app" hidden>
+  <aside class="sidebar">
+    <div class="brand"><span class="logo">&#9993;</span> Outreach Hub</div>
+    <nav id="nav"></nav>
+    <div class="side-foot">
+      <div id="conn" class="conn"></div>
+    </div>
+  </aside>
+  <main>
+    <div id="banner"></div>
+    <div id="view"></div>
+  </main>
+</div>
+
+<div id="login" class="login-wrap" hidden>
+  <form id="login-form" class="login-card">
+    <div class="brand"><span class="logo">&#9993;</span> Outreach Hub</div>
+    <p class="muted">Connect this page to your own Worker. Nothing is stored on a server except your Worker's database.</p>
+    <label>Worker URL
+      <input name="url" type="url" placeholder="https://outreach-hub.yourname.workers.dev" required autocomplete="url">
+    </label>
+    <label>Password
+      <input name="password" type="password" placeholder="The APP_PASSWORD you set" required autocomplete="current-password">
+    </label>
+    <div id="login-error" class="error-text"></div>
+    <button class="btn primary" type="submit">Connect</button>
+  </form>
+</div>
+
+<div id="toasts"></div>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
