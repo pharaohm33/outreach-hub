@@ -26,7 +26,6 @@ const SCHEMA = [
     call_attempts INTEGER NOT NULL DEFAULT 0, last_called_at INTEGER, last_disposition TEXT,
     last_message_at INTEGER, unread INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
-  `CREATE INDEX IF NOT EXISTS idx_contacts_msg ON contacts(last_message_at)`,
   `CREATE TABLE IF NOT EXISTS campaigns (
     id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, body TEXT NOT NULL,
     audience TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'running',
@@ -38,19 +37,30 @@ const SCHEMA = [
     provider_sid TEXT, error TEXT, campaign_id INTEGER,
     created_at INTEGER NOT NULL, sent_at INTEGER, send_at INTEGER NOT NULL DEFAULT 0,
     step INTEGER NOT NULL DEFAULT 0, delay_ms INTEGER NOT NULL DEFAULT 0)`,
-  `CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_id, id)`,
-  `CREATE INDEX IF NOT EXISTS idx_messages_queue ON messages(status, send_at)`,
-  `CREATE INDEX IF NOT EXISTS idx_messages_sid ON messages(provider_sid)`,
   `CREATE TABLE IF NOT EXISTS calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT, contact_id INTEGER, provider_sid TEXT,
     to_number TEXT, status TEXT NOT NULL DEFAULT 'initiated',
     answered_by TEXT, vm_dropped INTEGER NOT NULL DEFAULT 0, recording_id TEXT,
     duration INTEGER NOT NULL DEFAULT 0, disposition TEXT, notes TEXT NOT NULL DEFAULT '',
     started_at INTEGER NOT NULL, answered_at INTEGER, connected_at INTEGER, ended_at INTEGER)`,
-  `CREATE INDEX IF NOT EXISTS idx_calls_started ON calls(started_at)`,
   `CREATE TABLE IF NOT EXISTS recordings (
     id TEXT PRIMARY KEY, name TEXT NOT NULL, mime TEXT NOT NULL, seconds REAL NOT NULL DEFAULT 0,
     data TEXT NOT NULL, created_at INTEGER NOT NULL)`,
+];
+
+const INDEXES = [
+  `CREATE INDEX IF NOT EXISTS idx_contacts_msg ON contacts(last_message_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_id, id)`,
+  `CREATE INDEX IF NOT EXISTS idx_messages_queue ON messages(status, send_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_messages_sid ON messages(provider_sid)`,
+  `CREATE INDEX IF NOT EXISTS idx_calls_started ON calls(started_at)`,
+];
+
+/** Columns added after the first release. CREATE TABLE IF NOT EXISTS will not add them to a database that already has the table. */
+const COLUMNS = [
+  ['messages', 'send_at', 'INTEGER NOT NULL DEFAULT 0'], ['messages', 'step', 'INTEGER NOT NULL DEFAULT 0'], ['messages', 'delay_ms', 'INTEGER NOT NULL DEFAULT 0'],
+  ['campaigns', 'drip_seconds', 'INTEGER NOT NULL DEFAULT 0'], ['campaigns', 'followup_count', 'INTEGER NOT NULL DEFAULT 0'], ['campaigns', 'stop_on_reply', 'INTEGER NOT NULL DEFAULT 1'],
+  ['calls', 'connected_at', 'INTEGER'],
 ];
 
 const DEFAULTS = {
@@ -275,8 +285,16 @@ async function applyDisposition(env, call, disposition, notes) {
 
 /* ---------- HTTP entry ---------- */
 let schemaReady;
+async function setupSchema(env) {
+  await env.DB.batch(SCHEMA.map((q) => env.DB.prepare(q)));
+  for (const [table, col, def] of COLUMNS) {
+    const have = (await all(env, `PRAGMA table_info(${table})`)).map((c) => c.name);
+    if (!have.includes(col)) await run(env, `ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+  }
+  await env.DB.batch(INDEXES.map((q) => env.DB.prepare(q)));
+}
 function ensureSchema(env) {
-  schemaReady ||= env.DB.batch(SCHEMA.map((s) => env.DB.prepare(s))).catch((e) => { schemaReady = null; throw e; });
+  schemaReady ||= setupSchema(env).catch((e) => { schemaReady = null; throw e; });
   return schemaReady;
 }
 

@@ -12,6 +12,11 @@ const out = document.getElementById('out');
 let pass = 0, fail = 0;
 const t = (name, cond, extra) => { cond ? pass++ : fail++; out.textContent += `${cond ? 'PASS' : 'FAIL'}  ${name}${cond ? '' : '  -> ' + JSON.stringify(extra)}\n`; };
 const be = await createBackend();
+// Start from the table layout of the previous release so the automatic column upgrade is exercised by every test below.
+be.sdb.run(`CREATE TABLE campaigns (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, body TEXT NOT NULL, audience TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'running', total INTEGER NOT NULL DEFAULT 0, drip_seconds INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)`);
+be.sdb.run(`CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, contact_id INTEGER NOT NULL, direction TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL, provider_sid TEXT, error TEXT, campaign_id INTEGER, created_at INTEGER NOT NULL, sent_at INTEGER, send_at INTEGER NOT NULL DEFAULT 0)`);
+be.sdb.run(`CREATE INDEX idx_messages_queue ON messages(status, send_at)`);
+be.sdb.run(`CREATE TABLE calls (id INTEGER PRIMARY KEY AUTOINCREMENT, contact_id INTEGER, provider_sid TEXT, to_number TEXT, status TEXT NOT NULL DEFAULT 'initiated', answered_by TEXT, vm_dropped INTEGER NOT NULL DEFAULT 0, recording_id TEXT, duration INTEGER NOT NULL DEFAULT 0, disposition TEXT, notes TEXT NOT NULL DEFAULT '', started_at INTEGER NOT NULL, answered_at INTEGER, ended_at INTEGER)`);
 const call = async (method, path, body) => {
   const r = await fetch(WORKER_ORIGIN + '/api' + path, { method, headers: { Authorization: 'Bearer ' + PASSWORD, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
   return { status: r.status, data: await r.json().catch(() => null) };
@@ -29,6 +34,8 @@ try {
   let r = await fetch(WORKER_ORIGIN + '/api/status', { headers: { Authorization: 'Bearer nope' } });
   t('wrong password -> 401', r.status === 401);
   r = await call('GET', '/status');
+  const cols = (tbl) => be.sdb.exec(`PRAGMA table_info(${tbl})`)[0].values.map((v) => v[1]);
+  t('old database gets the new columns automatically', cols('messages').includes('step') && cols('messages').includes('delay_ms') && cols('campaigns').includes('followup_count') && cols('campaigns').includes('stop_on_reply') && cols('calls').includes('connected_at'), [cols('messages'), cols('campaigns')]);
   t('status ok', r.status === 200 && r.data.configured === true && r.data.voice_ready === false && r.data.settings.webhook_key === undefined && r.data.settings.session_sid === undefined, r);
 
   // setup
