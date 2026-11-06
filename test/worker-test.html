@@ -42,8 +42,14 @@ try {
   t('number webhooks set with secret key', /\/hook\/sms\?k=[0-9a-f]{48}$/.test(hooks.SmsUrl) && /\/hook\/inbound-call\?k=/.test(hooks.VoiceUrl), hooks);
   r = await call('GET', '/status');
   t('voice ready after setup', r.data.voice_ready === true && r.data.settings.agent_phone === '+16505550199', r.data);
-  r = await call('PUT', '/settings', { window_start: 0, window_end: 24, timezone: 'America/New_York' });
-  t('settings save', r.data.window_end === 24 && r.data.webhook_key === undefined, r);
+  r = await call('GET', '/settings');
+  t('contact hours are off by default, no time zone', r.data.enforce_hours === false && r.data.timezone === '' && r.data.drip_seconds === 60 && r.data.webhook_key === undefined, r.data);
+  r = await call('PUT', '/settings', { enforce_hours: true });
+  t('hours on needs a time zone', r.status === 400, r);
+  r = await call('PUT', '/settings', { enforce_hours: true, timezone: 'America/New_York', window_start: 9, window_end: 9 });
+  t('empty hours window rejected', r.status === 400, r);
+  r = await call('PUT', '/settings', { enforce_hours: false, call_script: 'Hi {{first_name}}' });
+  t('settings save', r.status === 200 && r.data.call_script === 'Hi {{first_name}}' && r.data.enforce_hours === false, r);
   r = await call('PUT', '/settings', { agent_phone: 'abc' });
   t('bad phone rejected', r.status === 400, r);
 
@@ -118,6 +124,32 @@ try {
   await call('POST', `/campaigns/${r.data.id}/pause`);
   r = await call('POST', '/sms/process');
   t('paused campaign not sent', r.data.sent === 0, r);
+
+  // drip: 1 text per X seconds
+  r = await call('POST', '/contacts/import', { tags: ['dripgroup'], contacts: [{ first_name: 'D1', phone: '4155557001' }, { first_name: 'D2', phone: '4155557002' }, { first_name: 'D3', phone: '4155557003' }] });
+  const before = sw('/Messages').length;
+  r = await call('POST', '/campaigns', { name: 'Drip', body: 'Hi {{first_name}}', tag: 'dripgroup', drip_seconds: 60, append_footer: false });
+  const dripId = r.data.id;
+  t('drip campaign created', r.data.total === 3, r);
+  let times = be.sdb.exec(`SELECT send_at FROM messages WHERE campaign_id = ${dripId} ORDER BY id`)[0].values.map((v) => v[0]);
+  t('drip messages are 60s apart', times[1] - times[0] === 60000 && times[2] - times[1] === 60000, times);
+  r = await call('POST', '/sms/process');
+  t('only the first drip text is due', r.data.sent === 1 && sw('/Messages').length === before + 1, r);
+  r = await call('POST', '/sms/process');
+  t('nothing more until 60s pass', r.data.sent === 0, r);
+  be.sdb.run(`UPDATE messages SET send_at = ${Date.now() - 1} WHERE campaign_id = ${dripId} AND status = 'queued'`);
+  r = await call('POST', '/sms/process');
+  t('overdue drip texts go out', r.data.sent === 2, r);
+  r = await call('GET', '/campaigns');
+  t('campaign lists its drip interval', r.data.find((c) => c.id === dripId).drip_seconds === 60 && r.data.find((c) => c.id === dripId).status === 'done', r.data[0]);
+  r = await call('POST', '/campaigns', { name: 'Drip2', body: 'Again {{first_name}}', tag: 'dripgroup', drip_seconds: 30, append_footer: false });
+  const drip2 = r.data.id;
+  await call('POST', `/campaigns/${drip2}/pause`);
+  be.sdb.run(`UPDATE messages SET send_at = 1 WHERE campaign_id = ${drip2}`);
+  await call('POST', `/campaigns/${drip2}/resume`);
+  times = be.sdb.exec(`SELECT send_at FROM messages WHERE campaign_id = ${drip2} ORDER BY id`)[0].values.map((v) => v[0]);
+  t('resume re-spaces the drip from now', times[0] > Date.now() - 5000 && times[1] - times[0] === 30000 && times[2] - times[1] === 30000, times);
+  await call('POST', `/campaigns/${drip2}/cancel`);
 
   // recordings
   r = await call('POST', '/recordings', { name: 'VM1', mime: 'audio/wav', data: btoa('RIFFxxxxWAVE'), seconds: 12 });
@@ -212,10 +244,14 @@ try {
 
   await call('POST', '/dialer/session/start');
   await be.webhook('/hook/agent-answer', { CallSid: sw('/Calls').pop().sid });
-  await call('PUT', '/settings', { window_start: 3, window_end: 3 });
   r = await call('POST', '/dialer/call', { contact_id: bob.id, auto_vm: false });
-  t('outside hours blocked', r.status === 400 && /calling hours/.test(r.data.error), r);
-  t('inWindow fn', inWindow({ timezone: 'America/New_York', window_start: 11, window_end: 20 }, new Date('2025-01-15T17:00:00Z')) === true && inWindow({ timezone: 'America/New_York', window_start: 11, window_end: 20 }, new Date('2025-01-15T06:00:00Z')) === false);
+  t('calls allowed any hour by default', r.status === 200, r);
+  await call('PUT', '/settings', { enforce_hours: true, timezone: 'America/New_York', window_start: 9, window_end: 20 });
+  be.sdb.run("UPDATE settings SET value = '3' WHERE key IN ('window_start', 'window_end')"); // an always-closed window, whatever time it is
+  r = await call('POST', '/dialer/call', { contact_id: bob.id, auto_vm: false });
+  t('outside hours blocked once turned on', r.status === 400 && /calling hours/.test(r.data.error), r);
+  const W = { enforce_hours: true, timezone: 'America/New_York', window_start: 11, window_end: 20 };
+  t('inWindow fn', inWindow(W, new Date('2025-01-15T17:00:00Z')) === true && inWindow(W, new Date('2025-01-15T06:00:00Z')) === false && inWindow({ ...W, enforce_hours: false }, new Date('2025-01-15T06:00:00Z')) === true && inWindow({ ...W, timezone: '' }, new Date('2025-01-15T06:00:00Z')) === true);
   r = await call('POST', '/sms/process');
   t('SMS queue honours hours', r.data.skipped === 'outside_hours', r);
 
@@ -224,7 +260,7 @@ try {
   t('inbound call rings your phone', hook.text.includes('<Dial timeout="20">+16505550199</Dial>'), hook.text);
 
   r = await call('GET', '/stats');
-  t('stats', r.data.contacts === 4 && r.data.voicemails >= 1 && r.data.sms_sent >= 1, r.data);
+  t('stats', r.data.contacts === 7 && r.data.voicemails >= 1 && r.data.sms_sent >= 1, r.data);
   r = await call('GET', '/calls');
   t('calls log', r.data.length >= 3 && r.data[0].first_name !== undefined, r.data.length);
 

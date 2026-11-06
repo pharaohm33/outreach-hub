@@ -4,10 +4,10 @@ A small GoHighLevel-style outreach tool on **your own SignalWire account**:
 
 - **Contacts**: CSV import, tags, statuses, opt-out and do-not-call flags
 - **Inbox**: two-way SMS conversations
-- **SMS campaigns**: merge fields (`{{first_name}}`), background sending, pause/cancel, reply counts, automatic STOP handling
+- **SMS campaigns**: merge fields (`{{first_name}}`), **drip sending (1 text every X seconds, default 60)** or fast batches, background sending, pause/resume/cancel, reply counts, automatic STOP handling
 - **Power dialer**: dials one lead at a time, detects answering machines, and either connects a person to you or plays your recorded **voicemail drop** and moves on. Auto-dial next lead, call script, dispositions, manual "Drop voicemail" button
 - **Voicemails**: record in the browser or upload a file
-- Calling-hours window, max attempts, do-not-call list
+- Optional contact-hours window (off until you turn it on), max attempts, do-not-call list
 
 ## How it fits together
 
@@ -78,8 +78,9 @@ If a greeting was not detected as a machine and you hear it, press **Drop voicem
 ## Things worth knowing
 - **It is not "ringless".** The drop is a real call: the phone rings, voicemail picks up, and your recording plays after the beep.
 - **Cost:** voice minutes for the lead call, plus the whole time your own phone leg stays open during a session, plus answering-machine detection fees and SMS segments. Check SignalWire's current pricing.
-- **Compliance is on you.** Only text people who opted in. Prerecorded voicemail drops count as calls under US TCPA rules, so you need permission for those numbers and should scrub the Do Not Call registry. STOP replies are honored automatically, and sending and calling are limited to the hours in Settings (default 11 AM to 8 PM Eastern, which sits inside 8 AM to 9 PM in every US time zone).
-- **One person, one call at a time.** Cloudflare's free plan allows about 20 campaign texts per minute (raise it in Settings on a paid plan). Voicemails are capped at roughly 80 seconds.
+- **Compliance is on you.** Only text people who opted in. Prerecorded voicemail drops count as calls under US TCPA rules, so you need permission for those numbers and should scrub the Do Not Call registry. STOP replies are honored automatically. No time-of-day limit is applied until you turn on **Contact hours** in Settings (US rules generally allow 8 AM to 9 PM in the contact's own time zone).
+- **Drip sending:** each campaign has a "Drip: send 1 text every X seconds" box (default 60, change the default in Settings). The Worker's once-a-minute cron sends whichever texts are due, so spacing under about 30 seconds is approximate. Untick drip for fast batches (about 20 a minute on Cloudflare's free plan).
+- **One person, one call at a time.** Voicemails are capped at roughly 80 seconds.
 - Your password and the Worker URL live in your browser's local storage. Sign out in Settings on shared computers.
 - Not yet verified against live SignalWire: this was built from SignalWire's documentation and tested against a simulator. Do your first calls on your own phone numbers.
 

@@ -2,6 +2,7 @@ import { get, post, qs } from '../api.js';
 import { $, esc, fmtDateTime, mergeFields, smsInfo, confirmDialog, toast, STATUS_LABELS } from '../util.js';
 
 let st, root, ctx, timer;
+const fmtSpan = (sec) => (sec < 90 ? `${Math.round(sec)} seconds` : sec < 5400 ? `${Math.round(sec / 60)} minutes` : `${(sec / 3600).toFixed(1)} hours`);
 
 const STATUS_BADGE = { running: 'green', paused: '', done: '', cancelled: 'red' };
 
@@ -23,6 +24,9 @@ function renderPreview() {
   const info = smsInfo(mergeFields(text, st.sample || {}));
   $('#preview', root).textContent = text ? mergeFields(text, st.sample || {}) : 'Your message appears here.';
   $('#count', root).textContent = `${info.len} characters, ${info.segments} part${info.segments === 1 ? '' : 's'} per text${info.unicode ? ' (emoji or special characters)' : ''}`;
+  const dripOn = $('#drip', root).checked, secs = Math.max(1, Number($('#drip-s', root).value) || 60);
+  $('#drip-s', root).disabled = !dripOn;
+  $('#drip-note', root).textContent = dripOn && st.audience ? `About ${fmtSpan(st.audience * secs)} to send everything.` : dripOn ? '' : 'Drip is off: texts go out in fast batches.';
   $('#aud', root).textContent = st.audience == null ? '' : `${st.audience.toLocaleString()} contact${st.audience === 1 ? '' : 's'} match (anyone who replied STOP is skipped automatically)`;
 }
 
@@ -34,7 +38,7 @@ async function loadList() {
     const pct = (n) => (c.total ? (n / c.total) * 100 : 0);
     return `<div class="card" style="margin-bottom:12px">
       <div class="row"><strong>${esc(c.name)}</strong><span class="badge ${STATUS_BADGE[c.status] ?? ''}">${esc(c.status)}</span><span class="spacer"></span><span class="muted small">${fmtDateTime(c.created_at)}</span></div>
-      <div class="muted small" style="margin:4px 0 8px">Audience: ${esc(c.audience)}</div>
+      <div class="muted small" style="margin:4px 0 8px">Audience: ${esc(c.audience)} &middot; ${c.drip_seconds ? `drip: 1 text every ${c.drip_seconds}s` : 'fast send'}</div>
       <div class="progress" title="${c.sent} sent, ${c.queued} queued, ${c.failed} failed"><i style="width:${pct(c.sent)}%"></i><i class="f" style="width:${pct(c.failed)}%"></i><i class="q" style="width:${pct(c.queued)}%"></i></div>
       <div class="row small muted" style="margin-top:8px"><span>${c.total} total</span><span>${c.sent} sent</span><span>${c.delivered} delivered</span><span>${c.queued} waiting</span><span>${c.failed} failed</span><span><strong>${c.replies} replied</strong></span>
         <span class="spacer"></span>
@@ -56,15 +60,19 @@ async function launch() {
   const s = ctx.status.settings;
   const n = st.audience ?? 0;
   if (!n) return toast('No contacts match this audience', 'error');
-  const perMin = s.sms_per_minute || 20;
+  const drip = $('#drip', root).checked ? Math.max(1, Number($('#drip-s', root).value) || 60) : 0;
+  const pace = drip
+    ? `1 text every ${drip} second${drip === 1 ? '' : 's'}, about ${fmtSpan(n * drip)} in total`
+    : `roughly ${s.sms_per_minute || 20} per minute`;
+  const hours = s.enforce_hours && s.timezone ? ` Sending only happens between ${s.window_start}:00 and ${s.window_end}:00 (${s.timezone}).` : '';
   const ok = await confirmDialog('Send this campaign?',
-    `About ${n.toLocaleString()} text${n === 1 ? '' : 's'} will be queued and sent at roughly ${perMin} per minute between ${s.window_start}:00 and ${s.window_end}:00 (${s.timezone}). You can pause or cancel any time. Only send to people who agreed to receive texts from you.`,
+    `About ${n.toLocaleString()} text${n === 1 ? '' : 's'} will be queued and sent at ${pace}.${hours} You can pause or cancel any time. Only send to people who agreed to receive texts from you.`,
     'Queue and send');
   if (!ok) return;
   const btn = $('[data-act=launch]', root);
   btn.disabled = true;
   try {
-    const r = await post('/campaigns', { name: $('#name', root).value.trim() || 'Campaign', body, tag, status, append_footer: $('#footer', root).checked });
+    const r = await post('/campaigns', { name: $('#name', root).value.trim() || 'Campaign', body, tag, status, append_footer: $('#footer', root).checked, drip_seconds: drip });
     toast(`${r.total} texts queued`, 'success');
     post('/sms/process').catch(() => {});
     $('#body', root).value = '';
@@ -81,7 +89,7 @@ export default {
     const tags = await get('/tags');
     root.innerHTML = `
       <div class="page-head"><div><h1>SMS Campaigns</h1><div class="sub">Bulk texts that send in the background, even with this page closed</div></div>
-        <button class="btn" data-act="process">Send next batch now</button></div>
+        <button class="btn" data-act="process" title="Sends whatever is due right now">Send what is due now</button></div>
       <div class="grid" style="grid-template-columns:minmax(300px,420px) 1fr;align-items:start">
         <div class="card">
           <h2>New campaign</h2>
@@ -93,6 +101,9 @@ export default {
           <div class="muted small" id="aud" style="margin:-6px 0 12px"></div>
           <label>Message<textarea id="body" rows="5" placeholder="Hi {{first_name}}, it's Sam from ..."></textarea></label>
           <div class="merge-chips">${['first_name', 'last_name', 'company', 'name'].map((f) => `<button type="button" class="chip btn-chip" data-act="chip" data-f="${f}">{{${f}}}</button>`).join('')}</div>
+          <label class="inline"><input type="checkbox" id="drip" checked> Drip: send 1 text every</label>
+          <input id="drip-s" type="number" min="1" max="86400" value="${s.drip_seconds || 60}" style="width:84px;margin:0 6px"> seconds
+          <div class="muted small" id="drip-note" style="margin:4px 0 12px"></div>
           <label class="inline"><input type="checkbox" id="footer" ${s.append_footer ? 'checked' : ''}> Add opt-out line: "${esc(s.sms_footer)}"</label>
           <div class="muted small" id="count" style="margin:10px 0 6px"></div>
           <div class="bubble-preview" id="preview"></div>
@@ -123,7 +134,7 @@ export default {
         }
       } catch (err) { toast(err.message, 'error'); }
     };
-    root.oninput = (e) => { if (e.target.id === 'body' || e.target.id === 'footer') renderPreview(); };
+    root.oninput = (e) => { if (['body', 'footer', 'drip', 'drip-s'].includes(e.target.id)) renderPreview(); };
     root.onchange = (e) => { if (e.target.id === 'tag' || e.target.id === 'status') refreshAudience().catch((x) => toast(x.message, 'error')); };
     await Promise.all([refreshAudience(), loadList()]);
   },

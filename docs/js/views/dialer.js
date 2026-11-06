@@ -29,6 +29,7 @@ const opts = () => ({
 });
 function windowOpen() {
   const s = S.settings;
+  if (!s.enforce_hours || !s.timezone) return true;
   try {
     const h = Number(new Intl.DateTimeFormat('en-US', { timeZone: s.timezone, hour: 'numeric', hourCycle: 'h23' }).format(new Date()));
     return h >= s.window_start && h < s.window_end;
@@ -68,7 +69,9 @@ function renderShell() {
 
 function renderChip() {
   const open = windowOpen(), s = S.settings;
-  $('#chip', root).innerHTML = `<span class="dot ${open ? 'on' : ''}"></span>Calling hours ${open ? 'open' : 'closed'} (${s.window_start}:00 to ${s.window_end}:00 ${esc(s.timezone)})`;
+  $('#chip', root).innerHTML = s.enforce_hours && s.timezone
+    ? `<span class="dot ${open ? 'on' : ''}"></span>Calling hours ${open ? 'open' : 'closed'} (${s.window_start}:00 to ${s.window_end}:00 ${esc(s.timezone)})`
+    : '<span class="dot on"></span>No calling-hours limit set (change it in Settings)';
 }
 function renderSessionBtn() {
   const el = $('#session-btn', root);

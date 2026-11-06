@@ -28,14 +28,14 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS campaigns (
     id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, body TEXT NOT NULL,
     audience TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'running',
-    total INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)`,
+    total INTEGER NOT NULL DEFAULT 0, drip_seconds INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT, contact_id INTEGER NOT NULL,
     direction TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL,
     provider_sid TEXT, error TEXT, campaign_id INTEGER,
-    created_at INTEGER NOT NULL, sent_at INTEGER)`,
+    created_at INTEGER NOT NULL, sent_at INTEGER, send_at INTEGER NOT NULL DEFAULT 0)`,
   `CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_id, id)`,
-  `CREATE INDEX IF NOT EXISTS idx_messages_queue ON messages(status, id)`,
+  `CREATE INDEX IF NOT EXISTS idx_messages_queue ON messages(status, send_at)`,
   `CREATE INDEX IF NOT EXISTS idx_messages_sid ON messages(provider_sid)`,
   `CREATE TABLE IF NOT EXISTS calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT, contact_id INTEGER, provider_sid TEXT,
@@ -51,16 +51,16 @@ const SCHEMA = [
 
 const DEFAULTS = {
   from_number: '', messaging_service_sid: '', agent_phone: '',
-  // 11:00-20:00 Eastern is inside 8am-9pm for every continental US time zone.
-  timezone: 'America/New_York', window_start: 11, window_end: 20,
-  sms_per_minute: 20, sms_footer: 'Reply STOP to opt out.', append_footer: true,
+  // No time restriction until you turn it on in Settings.
+  enforce_hours: false, timezone: '', window_start: 9, window_end: 20,
+  sms_per_minute: 20, drip_seconds: 60, sms_footer: 'Reply STOP to opt out.', append_footer: true,
   default_recording_id: '', auto_vm: true, call_script: '', max_attempts: 3, min_hours: 24,
   // internal, never sent to the browser
   public_url: '', webhook_key: '', session_conf: '', session_sid: '', session_status: 'none', session_started_at: 0,
 };
 const SETTING_TYPES = {
-  from_number: 'str', messaging_service_sid: 'str', agent_phone: 'str', timezone: 'str', window_start: 'int', window_end: 'int',
-  sms_per_minute: 'int', sms_footer: 'str', append_footer: 'bool', default_recording_id: 'str',
+  from_number: 'str', messaging_service_sid: 'str', agent_phone: 'str', enforce_hours: 'bool', timezone: 'str', window_start: 'int', window_end: 'int',
+  sms_per_minute: 'int', drip_seconds: 'int', sms_footer: 'str', append_footer: 'bool', default_recording_id: 'str',
   auto_vm: 'bool', call_script: 'str', max_attempts: 'int', min_hours: 'int',
 };
 const INTERNAL_SETTINGS = ['webhook_key', 'session_conf', 'session_sid', 'session_status', 'session_started_at'];
@@ -105,13 +105,14 @@ const tagStr = (arr) => {
 const tagArr = (s) => (s || '').split(',').filter(Boolean);
 const contactOut = (c) => ({ ...c, tags: tagArr(c.tags) });
 
-/** Is "now" inside the allowed contact window for the configured time zone? */
+/** Is "now" inside the allowed contact window? Always true unless the user turned hours on and chose a time zone. */
 function inWindow(s, now = new Date()) {
+  if (!s.enforce_hours || !s.timezone) return true;
   let hour;
   try {
     hour = Number(new Intl.DateTimeFormat('en-US', { timeZone: s.timezone, hour: 'numeric', hourCycle: 'h23' }).format(now));
   } catch {
-    hour = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: 'numeric', hourCycle: 'h23' }).format(now));
+    return true;
   }
   return hour >= s.window_start && hour < s.window_end;
 }
@@ -192,8 +193,14 @@ async function sendOne(env, msg, contact, s, origin) {
   }
 }
 
-/** Sends up to `limit` queued campaign messages. Called every minute by the cron trigger. */
-async function processQueue(env, origin, limit) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Sends queued campaign messages that are due. Each message has a send_at time: drip campaigns space them
+ * `drip_seconds` apart, other campaigns make them all due immediately (then capped by sms_per_minute per run).
+ * `horizon` lets the once-a-minute cron also pick up messages due within the next few seconds and wait for them.
+ */
+async function processQueue(env, origin, { limit, horizon = 0 } = {}) {
   const s = await getSettings(env);
   if (!s.from_number && !s.messaging_service_sid) return { sent: 0, failed: 0, skipped: 'no_sender' };
   if (!inWindow(s)) return { sent: 0, failed: 0, skipped: 'outside_hours' };
@@ -206,16 +213,24 @@ async function processQueue(env, origin, limit) {
   const claimed = (await prep(env, `UPDATE messages SET status = 'sending', sent_at = ? WHERE status = 'queued' AND id IN (
       SELECT m.id FROM messages m JOIN contacts c ON c.id = m.contact_id
       LEFT JOIN campaigns ca ON ca.id = m.campaign_id
-      WHERE m.status = 'queued' AND (ca.id IS NULL OR ca.status = 'running') ORDER BY m.id LIMIT ?)
-      RETURNING id, contact_id, body`, now, n).all()).results;
+      WHERE m.status = 'queued' AND m.send_at <= ? AND c.sms_opt_out = 0 AND (ca.id IS NULL OR ca.status = 'running')
+      ORDER BY m.send_at, m.id LIMIT ?)
+      RETURNING id, contact_id, campaign_id, body, send_at`, now, now + horizon, n).all()).results;
   let sent = 0, failed = 0;
   if (claimed.length) {
+    claimed.sort((a, b) => a.send_at - b.send_at || a.id - b.id);
     const phones = new Map((await all(env, `SELECT id, phone FROM contacts WHERE id IN (${claimed.map(() => '?').join(',')})`, ...claimed.map((m) => m.contact_id))).map((c) => [c.id, c.phone]));
-    for (let i = 0; i < claimed.length; i += 5) {
-      await Promise.all(claimed.slice(i, i + 5).map(async (m) => {
-        const r = await sendOne(env, m, { id: m.contact_id, phone: phones.get(m.contact_id) }, s, origin);
-        if (r.status === 'failed') failed++; else sent++;
-      }));
+    for (const m of claimed) {
+      const wait = m.send_at - Date.now();
+      if (wait > 0) {
+        await sleep(Math.min(wait, horizon));
+        // They may have replied STOP, or the campaign may have been paused or cancelled, while we waited.
+        const chk = await first(env, `SELECT c.sms_opt_out AS opt, ca.status AS cs FROM contacts c LEFT JOIN campaigns ca ON ca.id = ? WHERE c.id = ?`, m.campaign_id, m.contact_id);
+        if (chk?.opt) { await run(env, "UPDATE messages SET status = 'cancelled' WHERE id = ?", m.id); continue; }
+        if (m.campaign_id && chk?.cs !== 'running') { await run(env, "UPDATE messages SET status = ? WHERE id = ?", chk?.cs === 'cancelled' ? 'cancelled' : 'queued', m.id); continue; }
+      }
+      const r = await sendOne(env, m, { id: m.contact_id, phone: phones.get(m.contact_id) }, s, origin);
+      if (r.status === 'failed') failed++; else sent++;
     }
   }
   await run(env, `UPDATE campaigns SET status = 'done' WHERE status = 'running'
@@ -297,7 +312,7 @@ export default {
     ctx.waitUntil((async () => {
       await ensureSchema(env);
       const s = await getSettings(env);
-      if (s.public_url) await processQueue(env, s.public_url);
+      if (s.public_url) await processQueue(env, s.public_url, { horizon: 30000 });
     })());
   },
 };
@@ -490,10 +505,13 @@ const ROUTES = [
         out[k] = p;
       }
     }
-    if ('timezone' in out) {
+    if ('timezone' in out && out.timezone) {
       try { new Intl.DateTimeFormat('en-US', { timeZone: out.timezone }); } catch { throw new ApiError(400, 'Unknown time zone'); }
     }
     if (('window_start' in out && out.window_start > 23) || ('window_end' in out && out.window_end > 24)) throw new ApiError(400, 'Hours must be 0-24');
+    const merged = { ...(await getSettings(env)), ...out };
+    if (merged.enforce_hours && !merged.timezone) throw new ApiError(400, 'Pick a time zone to turn on contact hours.');
+    if (merged.enforce_hours && merged.window_start >= merged.window_end) throw new ApiError(400, 'The end hour must be later than the start hour.');
     await saveSettings(env, out);
     return publicSettings(await getSettings(env));
   }],
@@ -666,14 +684,16 @@ const ROUTES = [
     const f = contactFilter({ tag: body.tag, status: body.status });
     const where = (f.where ? f.where.replace(/^WHERE /, 'WHERE c.sms_opt_out = 0 AND ').replace(/\b(tags|status)\b/g, 'c.$1') : 'WHERE c.sms_opt_out = 0');
     const now = Date.now();
-    const created = await run(env, 'INSERT INTO campaigns(name, body, audience, status, total, created_at) VALUES(?, ?, ?, ?, 0, ?)',
-      name, text, [body.tag && `tag:${body.tag}`, body.status && `status:${body.status}`].filter(Boolean).join(' ') || 'all', 'running', now);
+    const drip = Math.max(0, Math.min(parseInt(body.drip_seconds, 10) || 0, 86400)); // 0 = no drip, send in fast batches
+    const created = await run(env, 'INSERT INTO campaigns(name, body, audience, status, total, drip_seconds, created_at) VALUES(?, ?, ?, ?, 0, ?, ?)',
+      name, text, [body.tag && `tag:${body.tag}`, body.status && `status:${body.status}`].filter(Boolean).join(' ') || 'all', 'running', drip, now);
     const id = created.meta.last_row_id;
-    const ins = await run(env, `INSERT INTO messages(contact_id, direction, body, status, campaign_id, created_at)
+    const sendAt = drip ? `${now} + (ROW_NUMBER() OVER (ORDER BY c.id) - 1) * ${drip * 1000}` : `${now}`;
+    const ins = await run(env, `INSERT INTO messages(contact_id, direction, body, status, campaign_id, created_at, send_at)
       SELECT c.id, 'out',
         replace(replace(replace(replace(?, '{{first_name}}', COALESCE(NULLIF(c.first_name, ''), 'there')), '{{last_name}}', c.last_name),
           '{{company}}', c.company), '{{name}}', COALESCE(NULLIF(trim(c.first_name || ' ' || c.last_name), ''), 'there')),
-        'queued', ${id}, ${now} FROM contacts c ${where}`, text, ...f.b);
+        'queued', ${id}, ${now}, ${sendAt} FROM contacts c ${where}`, text, ...f.b);
     const total = ins.meta.changes || 0;
     await run(env, "UPDATE campaigns SET total = ?, status = CASE WHEN ? = 0 THEN 'done' ELSE status END WHERE id = ?", total, total, id);
     return { id, total };
@@ -687,10 +707,18 @@ const ROUTES = [
       ]);
     } else {
       await run(env, 'UPDATE campaigns SET status = ? WHERE id = ? AND status IN (\'running\', \'paused\')', args[1] === 'pause' ? 'paused' : 'running', id);
+      if (args[1] === 'resume') {
+        // A drip that sat paused is re-spaced from now so the next texts do not all fire at once.
+        const ca = await first(env, 'SELECT drip_seconds FROM campaigns WHERE id = ?', id);
+        if (ca?.drip_seconds) {
+          await run(env, `UPDATE messages SET send_at = ? + (SELECT count(*) FROM messages m2 WHERE m2.campaign_id = messages.campaign_id AND m2.status = 'queued' AND m2.id < messages.id) * ?
+            WHERE campaign_id = ? AND status = 'queued'`, Date.now(), ca.drip_seconds * 1000, id);
+        }
+      }
     }
     return { ok: true };
   }],
-  ['POST', /^\/sms\/process$/, async ({ env, origin }) => processQueue(env, origin)],
+  ['POST', /^\/sms\/process$/, async ({ env, origin }) => processQueue(env, origin)], // only what is due right now
 
   /* voicemail recordings */
   ['GET', /^\/recordings$/, async ({ env }) => all(env, 'SELECT id, name, mime, seconds, created_at FROM recordings ORDER BY created_at DESC')],

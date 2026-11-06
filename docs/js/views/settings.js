@@ -5,7 +5,7 @@ let root, ctx;
 
 function render() {
   const st = ctx.status, s = st.settings;
-  const tzs = TIMEZONES.includes(s.timezone) ? TIMEZONES : [s.timezone, ...TIMEZONES];
+  const tzs = !s.timezone || TIMEZONES.includes(s.timezone) ? TIMEZONES : [s.timezone, ...TIMEZONES];
   const hours = (sel, max) => Array.from({ length: max + 1 }, (_, h) => `<option value="${h}" ${h === sel ? 'selected' : ''}>${h === 0 || h === 24 ? 'Midnight' : h === 12 ? 'Noon' : h < 12 ? h + ' AM' : h - 12 + ' PM'}</option>`).join('');
   root.innerHTML = `
     <div class="page-head"><div><h1>Settings</h1></div></div>
@@ -29,7 +29,8 @@ function render() {
         <div class="card">
           <h2>Texting</h2>
           <div class="field-row">
-            <label>Texts per minute<small>Free Cloudflare plan: keep at 20 or below</small><input id="sms_per_minute" type="number" min="1" max="90" value="${s.sms_per_minute}"></label>
+            <label>Default drip: 1 text every (seconds)<small>Used when you drip a campaign. 60 = one text a minute.</small><input id="drip_seconds" type="number" min="1" max="86400" value="${s.drip_seconds || 60}"></label>
+            <label>Fast send: texts per minute<small>Only when drip is off. Free Cloudflare plan: keep at 20 or below.</small><input id="sms_per_minute" type="number" min="1" max="90" value="${s.sms_per_minute}"></label>
             <label>Messaging Service SID <small>Optional, overrides the number</small><input id="messaging_service_sid" value="${esc(s.messaging_service_sid)}" placeholder="MG..."></label>
           </div>
           <label class="inline"><input type="checkbox" id="append_footer" ${s.append_footer ? 'checked' : ''}> Add an opt-out line to campaign texts</label>
@@ -40,9 +41,12 @@ function render() {
       <div class="grid">
         <div class="card">
           <h2>Contact hours</h2>
-          <p class="muted small">Campaign texts and dialer calls only go out inside this window. The default (11 AM to 8 PM Eastern) is within 8 AM to 9 PM for every US time zone.</p>
-          <label>Time zone<select id="timezone">${tzs.map((t) => `<option ${t === s.timezone ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select></label>
-          <div class="field-row"><label>From<select id="window_start">${hours(s.window_start, 23)}</select></label><label>Until<select id="window_end">${hours(s.window_end, 24)}</select></label></div>
+          <p class="muted small">Off by default: texts and calls go out at any hour. Turn it on to hold campaign texts and block dialer calls outside a window (US rules generally allow 8 AM to 9 PM in the contact's own time zone).</p>
+          <label class="inline"><input type="checkbox" id="enforce_hours" ${s.enforce_hours ? 'checked' : ''}> Only text and call during these hours</label>
+          <div id="hours-fields" style="margin-top:12px;${s.enforce_hours ? '' : 'opacity:.5'}">
+            <label>Time zone<select id="timezone"><option value="">(not set)</option>${tzs.map((t) => `<option ${t === s.timezone ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select></label>
+            <div class="field-row"><label>From<select id="window_start">${hours(s.window_start, 23)}</select></label><label>Until<select id="window_end">${hours(s.window_end, 24)}</select></label></div>
+          </div>
         </div>
 
         <div class="card">
@@ -87,6 +91,7 @@ export default {
     root = r; ctx = c;
     await ctx.refreshStatus();
     render();
+    root.onchange = (e) => { if (e.target.id === 'enforce_hours') $('#hours-fields', root).style.opacity = e.target.checked ? '' : '.5'; };
     root.onclick = async (e) => {
       const b = e.target.closest('[data-act]');
       if (!b) return;
@@ -103,7 +108,7 @@ export default {
           render();
         } else if (act === 'save') {
           const body = {};
-          for (const id of ['agent_phone', 'sms_per_minute', 'messaging_service_sid', 'append_footer', 'sms_footer', 'timezone', 'window_start', 'window_end', 'max_attempts', 'min_hours', 'auto_vm', 'call_script']) body[id] = val(id);
+          for (const id of ['agent_phone', 'drip_seconds', 'enforce_hours', 'sms_per_minute', 'messaging_service_sid', 'append_footer', 'sms_footer', 'timezone', 'window_start', 'window_end', 'max_attempts', 'min_hours', 'auto_vm', 'call_script']) body[id] = val(id);
           ctx.status.settings = await put('/settings', body);
           toast('Settings saved', 'success');
           await ctx.refreshStatus();
@@ -111,5 +116,5 @@ export default {
       } catch (err) { toast(err.message, 'error'); if (b) b.disabled = false; }
     };
   },
-  unmount() { root.onclick = null; },
+  unmount() { root.onclick = root.onchange = null; },
 };

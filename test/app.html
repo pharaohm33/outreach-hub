@@ -17,7 +17,7 @@ Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { 
 if (new URLSearchParams(location.search).has('seed')) {
   const call = (m, p, b) => fetch(WORKER_ORIGIN + '/api' + p, { method: m, headers: { Authorization: 'Bearer ' + PASSWORD, 'content-type': 'application/json' }, body: b && JSON.stringify(b) });
   await call('POST', '/setup', { phone_sid: 'PN1', phone_number: '+14155550100', agent_phone: '(650) 555-0199' });
-  await call('PUT', '/settings', { window_start: 0, window_end: 24, call_script: 'Hi {{first_name}}, this is Sam. Do you have a minute?' });
+  await call('PUT', '/settings', { call_script: 'Hi {{first_name}}, this is Sam. Do you have a minute?' });
   await call('POST', '/contacts/import', { tags: ['subscribers'], contacts: [
     { first_name: 'Ann', last_name: 'Lee', phone: '4155550101', company: 'Acme', email: 'ann@example.com' },
     { first_name: 'Bob', last_name: 'Ray', phone: '4155550102', company: 'Globex' },
