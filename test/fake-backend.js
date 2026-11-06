@@ -36,10 +36,23 @@ export async function createBackend() {
 
   const env = { DB, APP_PASSWORD: PASSWORD, SIGNALWIRE_SPACE: 'test', SIGNALWIRE_PROJECT_ID: 'PJtest', SIGNALWIRE_API_TOKEN: 'tok', ALLOWED_ORIGIN: '*' };
   const swLog = [];
+  // Mutable fake of SignalWire's 10DLC registry so tests can move through the approval stages.
+  const registry = { brands: [], campaigns: [], assignments: [], numberSms: true, fail: 0 };
   const realFetch = window.fetch.bind(window);
   let n = 1000;
   const fakeSignalWire = async (url, init) => {
     const u = new URL(url);
+    if (u.pathname.startsWith('/api/relay/rest/registry/beta')) {
+      const rp = u.pathname.replace('/api/relay/rest/registry/beta', '');
+      swLog.push({ method: init?.method, path: 'REGISTRY' + rp, params: {}, sid: null });
+      if (registry.fail) return new Response('{}', { status: registry.fail });
+      const data = (d) => new Response(JSON.stringify({ links: {}, data: d }), { status: 200 });
+      let m;
+      if (rp === '/brands') return data(registry.brands);
+      if ((m = /^\/brands\/([^/]+)\/campaigns$/.exec(rp))) return data(registry.campaigns.filter((c) => c.brand_id === m[1]));
+      if ((m = /^\/campaigns\/([^/]+)\/numbers$/.exec(rp))) return data(registry.assignments.filter((a) => a.campaign_id === m[1]).map((a) => ({ id: 'A1', state: a.state, campaign_id: a.campaign_id, phone_number: { id: 'P1', number: a.number } })));
+      return new Response('{}', { status: 404 });
+    }
     const params = Object.fromEntries(new URLSearchParams(init?.body || ''));
     const path = u.pathname.replace(/^\/api\/laml\/2010-04-01\/Accounts\/PJtest/, '');
     const entry = { method: init?.method, path, params, sid: null };
@@ -51,7 +64,7 @@ export async function createBackend() {
     }
     if (path === '/Calls') return ok({ sid: (entry.sid = 'CA' + n++), status: 'queued' }, 201);
     if (path.startsWith('/Calls/')) return ok({ sid: path.split('/')[2] });
-    if (path === '/IncomingPhoneNumbers') return ok({ incoming_phone_numbers: [{ sid: 'PN1', phone_number: '+14155550100', friendly_name: 'Main line', capabilities: { sms: true, voice: true } }] });
+    if (path === '/IncomingPhoneNumbers') return ok({ incoming_phone_numbers: [{ sid: 'PN1', phone_number: '+14155550100', friendly_name: 'Main line', capabilities: { sms: registry.numberSms, voice: true } }] });
     if (path.startsWith('/IncomingPhoneNumbers/')) return ok({ sid: 'PN1' });
     return ok({ message: 'not faked: ' + path }, 404);
   };
@@ -75,5 +88,5 @@ export async function createBackend() {
   }
   const lastSid = (path) => swLog.filter((l) => l.path === path && l.sid).pop()?.sid;
 
-  return { env, worker, webhook, swLog, sdb, lastSid };
+  return { env, worker, webhook, swLog, sdb, lastSid, registry };
 }

@@ -11,11 +11,25 @@ const VIEWS = {
   settings: { label: 'Settings', load: () => import('./views/settings.js') },
 };
 
+const REG_KEY = 'outreach-hub.registration';
 const ctx = {
   status: null,
+  registration: null,
   unread: 0,
   go(hash) { location.hash = hash; },
   async refreshStatus() { ctx.status = await get('/status'); renderBanner(); return ctx.status; },
+  /** Asks SignalWire whether your Brand, Campaign and number are approved for texting. */
+  async refreshRegistration() {
+    try { ctx.registration = await get('/registration'); } catch (e) { ctx.registration = { overall: 'unknown', message: e.message, steps: [], ready: false }; }
+    const r = ctx.registration;
+    try {
+      const prev = localStorage.getItem(REG_KEY);
+      if (r.overall !== 'unknown') localStorage.setItem(REG_KEY, r.overall);
+      if (r.ready && prev && prev !== 'ready') toast('Texting is now approved for your number. You can send campaigns.', 'success');
+    } catch { /* storage unavailable */ }
+    renderBanner();
+    return r;
+  },
   signOut() { config.clear(); showLogin(); },
 };
 let current = null; // { name, mod }
@@ -44,7 +58,10 @@ function renderBanner() {
   let msg = '';
   if (!s.configured) msg = 'Your Worker has no SignalWire credentials yet. Add <code>SIGNALWIRE_SPACE</code>, <code>SIGNALWIRE_PROJECT_ID</code> and <code>SIGNALWIRE_API_TOKEN</code> as secrets, then <a href="#/settings">finish setup in Settings</a>.';
   else if (!s.voice_ready || !s.sms_ready) msg = 'Almost there: <a href="#/settings">pick your SignalWire number and add your cell phone in Settings</a> to enable texting and calling.';
-  el.innerHTML = msg ? `<div class="alert">${msg}</div>` : '';
+  const r = ctx.registration;
+  const reg = s.configured && r && !r.ready && r.overall !== 'unknown'
+    ? `<div class="alert" style="margin-top:${msg ? '8px' : '0'}">Texting approval: ${esc(r.message)} <a href="#/dashboard">See status</a></div>` : '';
+  el.innerHTML = (msg ? `<div class="alert">${msg}</div>` : '') + reg;
 }
 
 async function route() {
@@ -93,6 +110,7 @@ async function enter() {
   }
   $('#login').hidden = true;
   $('#app').hidden = false;
+  ctx.refreshRegistration().catch(() => {}); // does not hold up the page
   await route();
   pollUnread();
   return true;

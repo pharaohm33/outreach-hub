@@ -2,6 +2,21 @@ import { get, post, qs } from '../api.js';
 import { $, esc, fmtDateTime, mergeFields, smsInfo, confirmDialog, toast, STATUS_LABELS } from '../util.js';
 
 let st, root, ctx, timer;
+const UNITS = [[1, 'minutes'], [60, 'hours'], [1440, 'days']];
+const fuRow = (n, unit, body = '') => `<div class="fu card" style="padding:12px;margin-bottom:8px;background:var(--panel-2)">
+  <div class="row" style="margin-bottom:8px"><span>Wait</span>
+    <input class="fu-n" type="number" min="1" value="${n}" style="width:72px">
+    <select class="fu-u" style="width:auto">${UNITS.map(([v, l]) => `<option value="${v}" ${v === unit ? 'selected' : ''}>${l}</option>`).join('')}</select>
+    <span class="muted small">after the previous text, then send:</span><span class="spacer"></span>
+    <button type="button" class="icon-btn" data-act="rm-fu" aria-label="Remove follow-up">&times;</button></div>
+  <textarea class="fu-body" rows="3" placeholder="Hi {{first_name}}, just following up...">${body}</textarea></div>`;
+function readFollowups(root) {
+  return [...root.querySelectorAll('.fu')].map((el) => ({
+    delay_minutes: (Number(el.querySelector('.fu-n').value) || 0) * Number(el.querySelector('.fu-u').value),
+    body: el.querySelector('.fu-body').value.trim(),
+    label: (() => { const n = el.querySelector('.fu-n').value, u = el.querySelector('.fu-u').selectedOptions[0].textContent; return `${n} ${Number(n) === 1 ? u.replace(/s$/, '') : u}`; })(),
+  }));
+}
 const fmtSpan = (sec) => (sec < 90 ? `${Math.round(sec)} seconds` : sec < 5400 ? `${Math.round(sec / 60)} minutes` : `${(sec / 3600).toFixed(1)} hours`);
 
 const STATUS_BADGE = { running: 'green', paused: '', done: '', cancelled: 'red' };
@@ -38,9 +53,9 @@ async function loadList() {
     const pct = (n) => (c.total ? (n / c.total) * 100 : 0);
     return `<div class="card" style="margin-bottom:12px">
       <div class="row"><strong>${esc(c.name)}</strong><span class="badge ${STATUS_BADGE[c.status] ?? ''}">${esc(c.status)}</span><span class="spacer"></span><span class="muted small">${fmtDateTime(c.created_at)}</span></div>
-      <div class="muted small" style="margin:4px 0 8px">Audience: ${esc(c.audience)} &middot; ${c.drip_seconds ? `drip: 1 text every ${c.drip_seconds}s` : 'fast send'}</div>
+      <div class="muted small" style="margin:4px 0 8px">Audience: ${esc(c.audience)} &middot; ${c.drip_seconds ? `drip: 1 text every ${c.drip_seconds}s` : 'fast send'}${c.followup_count ? ` &middot; ${c.followup_count} follow-up${c.followup_count === 1 ? '' : 's'}${c.stop_on_reply ? ' (stop on reply)' : ''}` : ''}</div>
       <div class="progress" title="${c.sent} sent, ${c.queued} queued, ${c.failed} failed"><i style="width:${pct(c.sent)}%"></i><i class="f" style="width:${pct(c.failed)}%"></i><i class="q" style="width:${pct(c.queued)}%"></i></div>
-      <div class="row small muted" style="margin-top:8px"><span>${c.total} total</span><span>${c.sent} sent</span><span>${c.delivered} delivered</span><span>${c.queued} waiting</span><span>${c.failed} failed</span><span><strong>${c.replies} replied</strong></span>
+      <div class="row small muted" style="margin-top:8px"><span>${c.total} total</span><span>${c.sent} sent</span><span>${c.delivered} delivered</span><span>${c.queued} waiting</span><span>${c.failed} failed</span>${c.followup_count ? `<span>${c.followups_sent} follow-ups sent</span><span>${c.followups_waiting} scheduled</span>` : ''}<span><strong>${c.replies} replied</strong></span>
         <span class="spacer"></span>
         ${c.status === 'running' ? `<button class="btn sm" data-act="pause" data-id="${c.id}">Pause</button>` : ''}
         ${c.status === 'paused' ? `<button class="btn sm" data-act="resume" data-id="${c.id}">Resume</button>` : ''}
@@ -64,18 +79,27 @@ async function launch() {
   const pace = drip
     ? `1 text every ${drip} second${drip === 1 ? '' : 's'}, about ${fmtSpan(n * drip)} in total`
     : `roughly ${s.sms_per_minute || 20} per minute`;
+  const followups = readFollowups(root);
+  if (followups.some((f) => !f.body)) return toast('Write a message for every follow-up, or remove the empty ones.', 'error');
+  if (followups.some((f) => f.delay_minutes < 1)) return toast('Follow-up delays must be at least 1 minute.', 'error');
+  const fuText = followups.length
+    ? ` Then ${followups.length} follow-up${followups.length === 1 ? '' : 's'}: ${followups.map((f) => `${f.label} later`).join(', ')}${$('#stop-reply', root).checked ? '. Anyone who replies stops getting follow-ups' : ''}.`
+    : '';
   const hours = s.enforce_hours && s.timezone ? ` Sending only happens between ${s.window_start}:00 and ${s.window_end}:00 (${s.timezone}).` : '';
   const ok = await confirmDialog('Send this campaign?',
-    `About ${n.toLocaleString()} text${n === 1 ? '' : 's'} will be queued and sent at ${pace}.${hours} You can pause or cancel any time. Only send to people who agreed to receive texts from you.`,
+    `About ${n.toLocaleString()} text${n === 1 ? '' : 's'} will be queued and sent at ${pace}.${hours} ${fuText} You can pause or cancel any time. Only send to people who agreed to receive texts from you.`,
     'Queue and send');
   if (!ok) return;
   const btn = $('[data-act=launch]', root);
   btn.disabled = true;
   try {
-    const r = await post('/campaigns', { name: $('#name', root).value.trim() || 'Campaign', body, tag, status, append_footer: $('#footer', root).checked, drip_seconds: drip });
+    const r = await post('/campaigns', { name: $('#name', root).value.trim() || 'Campaign', body, tag, status, append_footer: $('#footer', root).checked, drip_seconds: drip,
+      followups: followups.map((f) => ({ delay_minutes: f.delay_minutes, body: f.body })), stop_on_reply: $('#stop-reply', root).checked });
     toast(`${r.total} texts queued`, 'success');
     post('/sms/process').catch(() => {});
     $('#body', root).value = '';
+    $('#fu-list', root).innerHTML = '';
+    $('#fu-stop', root).hidden = true;
     renderPreview();
     await loadList();
   } catch (e) { toast(e.message, 'error'); } finally { btn.disabled = false; }
@@ -90,6 +114,7 @@ export default {
     root.innerHTML = `
       <div class="page-head"><div><h1>SMS Campaigns</h1><div class="sub">Bulk texts that send in the background, even with this page closed</div></div>
         <button class="btn" data-act="process" title="Sends whatever is due right now">Send what is due now</button></div>
+      ${c.registration && !c.registration.ready && c.registration.overall !== 'unknown' ? `<div class="alert" style="margin-bottom:14px"><strong>Not approved to text yet.</strong> ${esc(c.registration.message)} Carriers may block or filter texts until it is approved. <a href="#/dashboard">See status</a></div>` : ''}
       <div class="grid" style="grid-template-columns:minmax(300px,420px) 1fr;align-items:start">
         <div class="card">
           <h2>New campaign</h2>
@@ -101,6 +126,13 @@ export default {
           <div class="muted small" id="aud" style="margin:-6px 0 12px"></div>
           <label>Message<textarea id="body" rows="5" placeholder="Hi {{first_name}}, it's Sam from ..."></textarea></label>
           <div class="merge-chips">${['first_name', 'last_name', 'company', 'name'].map((f) => `<button type="button" class="chip btn-chip" data-act="chip" data-f="${f}">{{${f}}}</button>`).join('')}</div>
+          <div style="margin:4px 0 14px">
+            <div class="row" style="justify-content:space-between;margin-bottom:8px"><strong>Follow-up texts</strong>
+              <button type="button" class="btn sm" data-act="add-fu">+ Add follow-up</button></div>
+            <div class="muted small" id="fu-help" style="margin-bottom:8px">Optional. Send more texts later, for example 1 day and then 3 days after the first one.</div>
+            <div id="fu-list"></div>
+            <label class="inline" id="fu-stop" hidden><input type="checkbox" id="stop-reply" checked> Stop follow-ups for anyone who replies</label>
+          </div>
           <label class="inline"><input type="checkbox" id="drip" checked> Drip: send 1 text every</label>
           <input id="drip-s" type="number" min="1" max="86400" value="${s.drip_seconds || 60}" style="width:84px;margin:0 6px"> seconds
           <div class="muted small" id="drip-note" style="margin:4px 0 12px"></div>
@@ -117,7 +149,15 @@ export default {
       const act = b.dataset.act;
       try {
         if (act === 'launch') await launch();
-        else if (act === 'chip') {
+        else if (act === 'add-fu') {
+          const n = root.querySelectorAll('.fu').length;
+          if (n >= 5) return toast('Up to 5 follow-ups per campaign.', 'error');
+          $('#fu-list', root).insertAdjacentHTML('beforeend', fuRow(n + 1, 1440));
+          $('#fu-stop', root).hidden = false;
+        } else if (act === 'rm-fu') {
+          b.closest('.fu').remove();
+          $('#fu-stop', root).hidden = !root.querySelector('.fu');
+        } else if (act === 'chip') {
           const ta = $('#body', root), tok = `{{${b.dataset.f}}}`;
           const i = ta.selectionStart ?? ta.value.length;
           ta.value = ta.value.slice(0, i) + tok + ta.value.slice(ta.selectionEnd ?? i);

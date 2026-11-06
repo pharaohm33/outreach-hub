@@ -11,6 +11,8 @@ const MAX_AUDIO_B64 = 1_800_000; // keeps one D1 row under its 2 MB limit (~85 s
 const OPT_OUT = /^\s*(stop|stopall|unsubscribe|cancel|end|quit)\s*[.!]*\s*$/i;
 const OPT_IN = /^\s*(start|unstop|yes)\s*[.!]*\s*$/i;
 const MACHINE = /^(machine|fax)/;
+const NOT_YET = 9000000000000000; // send_at of a follow-up whose earlier text has not gone out yet
+const MAX_FOLLOWUPS = 5;
 const TERMINAL = ['completed', 'failed', 'busy', 'no-answer', 'canceled'];
 
 const SCHEMA = [
@@ -28,12 +30,14 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS campaigns (
     id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, body TEXT NOT NULL,
     audience TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'running',
-    total INTEGER NOT NULL DEFAULT 0, drip_seconds INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)`,
+    total INTEGER NOT NULL DEFAULT 0, drip_seconds INTEGER NOT NULL DEFAULT 0,
+    followup_count INTEGER NOT NULL DEFAULT 0, stop_on_reply INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT, contact_id INTEGER NOT NULL,
     direction TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL,
     provider_sid TEXT, error TEXT, campaign_id INTEGER,
-    created_at INTEGER NOT NULL, sent_at INTEGER, send_at INTEGER NOT NULL DEFAULT 0)`,
+    created_at INTEGER NOT NULL, sent_at INTEGER, send_at INTEGER NOT NULL DEFAULT 0,
+    step INTEGER NOT NULL DEFAULT 0, delay_ms INTEGER NOT NULL DEFAULT 0)`,
   `CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_id, id)`,
   `CREATE INDEX IF NOT EXISTS idx_messages_queue ON messages(status, send_at)`,
   `CREATE INDEX IF NOT EXISTS idx_messages_sid ON messages(provider_sid)`,
@@ -180,10 +184,13 @@ async function sendOne(env, msg, contact, s, origin) {
   const now = Date.now();
   try {
     const d = await sw(env, 'POST', '/Messages', params);
-    await env.DB.batch([
+    const stmts = [
       prep(env, "UPDATE messages SET status = 'sent', provider_sid = ?, sent_at = ?, error = NULL WHERE id = ?", d.sid, now, msg.id),
       prep(env, 'UPDATE contacts SET last_message_at = ?, updated_at = ? WHERE id = ?', now, now, contact.id),
-    ]);
+    ];
+    // The next follow-up in the sequence is due `delay` after THIS text actually went out.
+    if (msg.campaign_id) stmts.push(prep(env, "UPDATE messages SET send_at = ? + delay_ms WHERE campaign_id = ? AND contact_id = ? AND step = ? AND status = 'queued'", now, msg.campaign_id, contact.id, (msg.step || 0) + 1));
+    await env.DB.batch(stmts);
     return { ...msg, status: 'sent', provider_sid: d.sid, sent_at: now };
   } catch (e) {
     const stmts = [prep(env, "UPDATE messages SET status = 'failed', error = ?, sent_at = ? WHERE id = ?", e.message, now, msg.id)];
@@ -209,13 +216,16 @@ async function processQueue(env, origin, { limit, horizon = 0 } = {}) {
   await env.DB.batch([
     prep(env, "UPDATE messages SET status = 'queued' WHERE status = 'sending' AND sent_at < ?", now - 300000), // recover crashed claims
     prep(env, "UPDATE messages SET status = 'cancelled' WHERE status = 'queued' AND contact_id IN (SELECT id FROM contacts WHERE sms_opt_out = 1)"),
+    // A follow-up is pointless if the text before it failed or was cancelled.
+    prep(env, `UPDATE messages SET status = 'cancelled' WHERE status = 'queued' AND step > 0 AND EXISTS (SELECT 1 FROM messages p
+      WHERE p.campaign_id = messages.campaign_id AND p.contact_id = messages.contact_id AND p.step < messages.step AND p.status IN ('failed', 'undelivered', 'cancelled'))`),
   ]);
   const claimed = (await prep(env, `UPDATE messages SET status = 'sending', sent_at = ? WHERE status = 'queued' AND id IN (
       SELECT m.id FROM messages m JOIN contacts c ON c.id = m.contact_id
       LEFT JOIN campaigns ca ON ca.id = m.campaign_id
       WHERE m.status = 'queued' AND m.send_at <= ? AND c.sms_opt_out = 0 AND (ca.id IS NULL OR ca.status = 'running')
       ORDER BY m.send_at, m.id LIMIT ?)
-      RETURNING id, contact_id, campaign_id, body, send_at`, now, now + horizon, n).all()).results;
+      RETURNING id, contact_id, campaign_id, body, send_at, step`, now, now + horizon, n).all()).results;
   let sent = 0, failed = 0;
   if (claimed.length) {
     claimed.sort((a, b) => a.send_at - b.send_at || a.id - b.id);
@@ -356,6 +366,8 @@ async function webhook(request, env, url) {
       prep(env, "INSERT INTO messages(contact_id, direction, body, status, provider_sid, created_at) VALUES(?, 'in', ?, 'received', ?, ?)", c.id, body, params.MessageSid || null, now),
       prep(env, 'UPDATE contacts SET last_message_at = ?, unread = unread + 1, updated_at = ? WHERE id = ?', now, now, c.id),
     ];
+    // Anyone who writes back drops out of follow-up sequences that are set to stop on reply.
+    stmts.push(prep(env, "UPDATE messages SET status = 'cancelled' WHERE contact_id = ? AND status = 'queued' AND step > 0 AND campaign_id IN (SELECT id FROM campaigns WHERE stop_on_reply = 1)", c.id));
     let reply = '';
     if (OPT_OUT.test(body)) {
       stmts.push(prep(env, 'UPDATE contacts SET sms_opt_out = 1 WHERE id = ?', c.id));
@@ -475,6 +487,79 @@ function contactFilter(q) {
   return { where: w.length ? 'WHERE ' + w.join(' AND ') : '', b };
 }
 
+/* ---------- messaging approval (10DLC registration) status ---------- */
+const GOOD_STATE = /^(completed|complete|active|processed)$/;
+const norm = (v) => String(v || '').toLowerCase();
+
+async function swRegistry(env, path) {
+  needSW(env);
+  const r = await fetch(`https://${swHost(env)}/api/relay/rest/registry/beta${path}`, {
+    headers: { Authorization: 'Basic ' + btoa(`${env.SIGNALWIRE_PROJECT_ID}:${env.SIGNALWIRE_API_TOKEN}`), Accept: 'application/json' },
+  });
+  if (r.status === 401 || r.status === 403) throw new ApiError(502, 'Your API token cannot read the registration status. Create a token with the Messaging and Numbers scopes.');
+  if (!r.ok) throw new ApiError(502, `SignalWire registry answered ${r.status}.`);
+  return r.json();
+}
+async function listNumbers(env) {
+  const d = await sw(env, 'GET', '/IncomingPhoneNumbers?PageSize=100');
+  const list = d.incoming_phone_numbers || d.data || [];
+  return list.map((n) => ({ sid: n.sid || n.id, phone_number: n.phone_number || n.number, name: n.friendly_name || n.name || '', sms: n.capabilities ? !!n.capabilities.sms : true, voice: n.capabilities ? !!n.capabilities.voice : true }));
+}
+
+/** Reads brand, campaign and number-assignment states and boils them down to one overall stage. */
+async function registrationStatus(env, s) {
+  const out = {
+    overall: 'unknown', message: '', ready: false, from_number: s.from_number, number_sms: null,
+    dashboard_url: `https://${swHost(env)}/registry/brands`, brands: [], campaigns: [], assignments: [], steps: [],
+  };
+  try {
+    const nums = await listNumbers(env);
+    const mine = nums.find((n) => n.phone_number === s.from_number);
+    out.number_sms = mine ? mine.sms : null;
+  } catch { /* the registry check below can still work */ }
+  try {
+    for (const b of ((await swRegistry(env, '/brands')).data || []).slice(0, 5)) {
+      out.brands.push({ id: b.id, name: b.name || b.company_name, state: norm(b.state) });
+      for (const c of ((await swRegistry(env, `/brands/${b.id}/campaigns`).catch(() => ({}))).data || []).slice(0, 5)) {
+        out.campaigns.push({ id: c.id, name: c.name, brand_id: b.id, state: norm(c.state) });
+        if (['active', 'pending'].includes(norm(c.state))) {
+          for (const a of ((await swRegistry(env, `/campaigns/${c.id}/numbers`).catch(() => ({}))).data || []).slice(0, 25)) {
+            out.assignments.push({ campaign_id: c.id, number: a.phone_number?.number || a.phone_number, state: norm(a.state) });
+          }
+        }
+      }
+    }
+  } catch (e) {
+    out.message = e.message;
+    return out; // overall stays 'unknown'
+  }
+  const mineA = out.assignments.filter((a) => a.number === s.from_number);
+  const brandOk = out.brands.some((b) => GOOD_STATE.test(b.state));
+  const campaignActive = out.campaigns.some((c) => c.state === 'active');
+  const numberOk = mineA.some((a) => GOOD_STATE.test(a.state));
+  const state = (done, waiting, problem) => (done ? 'done' : problem ? 'problem' : waiting ? 'waiting' : 'todo');
+  out.steps = [
+    { key: 'brand', label: 'Brand verified', state: state(brandOk, out.brands.some((b) => b.state === 'pending'), out.brands.length && out.brands.every((b) => b.state === 'unverified')) },
+    { key: 'campaign', label: 'Campaign approved', state: state(campaignActive, out.campaigns.some((c) => c.state === 'pending'), out.campaigns.length && !campaignActive && out.campaigns.every((c) => c.state === 'inactive')) },
+    { key: 'number', label: s.from_number ? `Number ${s.from_number} assigned` : 'Number assigned', state: state(numberOk, mineA.some((a) => a.state === 'pending'), mineA.some((a) => a.state === 'failed') && !numberOk) },
+  ];
+  if (!out.brands.length) { out.overall = 'not_started'; out.message = 'No brand registered yet. Create your Brand in the SignalWire registry to start approval.'; }
+  else if (brandOk && campaignActive && numberOk) { out.overall = 'ready'; out.ready = true; out.message = 'Texting is approved for your number.'; }
+  else if (!brandOk) {
+    const unv = out.brands.every((b) => b.state === 'unverified');
+    out.overall = unv ? 'brand_unverified' : 'brand_pending';
+    out.message = unv ? 'Your Brand failed identity verification. Open the SignalWire registry to fix it.' : 'Your Brand is still being verified (usually about a day).';
+  } else if (!out.campaigns.length) { out.overall = 'no_campaign'; out.message = 'Brand verified. Next: register a Campaign in the SignalWire registry.'; }
+  else if (!campaignActive) {
+    const dead = out.campaigns.every((c) => c.state === 'inactive');
+    out.overall = dead ? 'campaign_inactive' : 'campaign_pending';
+    out.message = dead ? 'Your Campaign is inactive or was rejected. Open the SignalWire registry to see why.' : 'Brand verified. Your Campaign is under review (about 3 to 5 business days, then 1 to 2 more for carrier vetting).';
+  } else if (mineA.some((a) => a.state === 'failed') && !numberOk) { out.overall = 'number_failed'; out.message = 'Assigning your number to the Campaign failed. Open the SignalWire registry and retry the assignment.'; }
+  else if (mineA.length) { out.overall = 'number_pending'; out.message = 'Campaign approved. Your number is being assigned (up to 24 hours).'; }
+  else { out.overall = 'number_unassigned'; out.message = 'Campaign approved. Assign your number to it under Campaign Phone Numbers in the SignalWire registry.'; }
+  return out;
+}
+
 const sessionInfo = (s) => ({ status: s.session_status, started_at: s.session_started_at, agent_phone: s.agent_phone });
 
 const ROUTES = [
@@ -488,6 +573,8 @@ const ROUTES = [
       origin, settings: publicSettings(s),
     };
   }],
+
+  ['GET', /^\/registration$/, async ({ env }) => registrationStatus(env, await getSettings(env))],
 
   ['GET', /^\/settings$/, async ({ env }) => publicSettings(await getSettings(env))],
   ['PUT', /^\/settings$/, async ({ env, body }) => {
@@ -517,11 +604,7 @@ const ROUTES = [
   }],
 
   // One-click wiring: point the number's text and call webhooks at this Worker and remember your own phone.
-  ['GET', /^\/numbers$/, async ({ env }) => {
-    const d = await sw(env, 'GET', '/IncomingPhoneNumbers?PageSize=100');
-    const list = d.incoming_phone_numbers || d.data || [];
-    return list.map((n) => ({ sid: n.sid || n.id, phone_number: n.phone_number || n.number, name: n.friendly_name || n.name || '', sms: n.capabilities ? !!n.capabilities.sms : true, voice: n.capabilities ? !!n.capabilities.voice : true }));
-  }],
+  ['GET', /^\/numbers$/, async ({ env }) => listNumbers(env)],
   ['POST', /^\/setup$/, async ({ env, body, origin }) => {
     const phone = normPhone(body.phone_number);
     const agent = normPhone(body.agent_phone);
@@ -666,10 +749,12 @@ const ROUTES = [
 
   /* campaigns */
   ['GET', /^\/campaigns$/, async ({ env }) => all(env, `SELECT ca.*,
-      (SELECT count(*) FROM messages WHERE campaign_id = ca.id AND status IN ('queued', 'sending')) AS queued,
-      (SELECT count(*) FROM messages WHERE campaign_id = ca.id AND status IN ('sent', 'delivered')) AS sent,
-      (SELECT count(*) FROM messages WHERE campaign_id = ca.id AND status = 'delivered') AS delivered,
-      (SELECT count(*) FROM messages WHERE campaign_id = ca.id AND status IN ('failed', 'undelivered')) AS failed,
+      (SELECT count(*) FROM messages WHERE campaign_id = ca.id AND step = 0 AND status IN ('queued', 'sending')) AS queued,
+      (SELECT count(*) FROM messages WHERE campaign_id = ca.id AND step = 0 AND status IN ('sent', 'delivered')) AS sent,
+      (SELECT count(*) FROM messages WHERE campaign_id = ca.id AND step = 0 AND status = 'delivered') AS delivered,
+      (SELECT count(*) FROM messages WHERE campaign_id = ca.id AND step = 0 AND status IN ('failed', 'undelivered')) AS failed,
+      (SELECT count(*) FROM messages WHERE campaign_id = ca.id AND step > 0 AND status IN ('queued', 'sending')) AS followups_waiting,
+      (SELECT count(*) FROM messages WHERE campaign_id = ca.id AND step > 0 AND status IN ('sent', 'delivered')) AS followups_sent,
       (SELECT count(DISTINCT r.contact_id) FROM messages r WHERE r.direction = 'in' AND r.contact_id IN (SELECT contact_id FROM messages WHERE campaign_id = ca.id AND sent_at IS NOT NULL) AND r.created_at >= ca.created_at) AS replies
       FROM campaigns ca ORDER BY ca.id DESC LIMIT 50`)],
   ['POST', /^\/campaigns$/, async ({ env, body }) => {
@@ -685,8 +770,16 @@ const ROUTES = [
     const where = (f.where ? f.where.replace(/^WHERE /, 'WHERE c.sms_opt_out = 0 AND ').replace(/\b(tags|status)\b/g, 'c.$1') : 'WHERE c.sms_opt_out = 0');
     const now = Date.now();
     const drip = Math.max(0, Math.min(parseInt(body.drip_seconds, 10) || 0, 86400)); // 0 = no drip, send in fast batches
-    const created = await run(env, 'INSERT INTO campaigns(name, body, audience, status, total, drip_seconds, created_at) VALUES(?, ?, ?, ?, 0, ?, ?)',
-      name, text, [body.tag && `tag:${body.tag}`, body.status && `status:${body.status}`].filter(Boolean).join(' ') || 'all', 'running', drip, now);
+    const withFooter = (b) => (body.append_footer ?? s.append_footer) && s.sms_footer && !b.toLowerCase().includes('stop') ? b + '\n' + s.sms_footer : b;
+    const followups = (Array.isArray(body.followups) ? body.followups : []).slice(0, MAX_FOLLOWUPS).map((f) => ({
+      body: String(f?.body || '').trim(), delay_ms: Math.round(Number(f?.delay_minutes) * 60000),
+    }));
+    for (const fu of followups) {
+      if (!fu.body) throw new ApiError(400, 'Every follow-up needs a message.');
+      if (!(fu.delay_ms >= 60000) || fu.delay_ms > 90 * 86400000) throw new ApiError(400, 'Follow-up delays must be between 1 minute and 90 days.');
+    }
+    const created = await run(env, 'INSERT INTO campaigns(name, body, audience, status, total, drip_seconds, followup_count, stop_on_reply, created_at) VALUES(?, ?, ?, ?, 0, ?, ?, ?, ?)',
+      name, text, [body.tag && `tag:${body.tag}`, body.status && `status:${body.status}`].filter(Boolean).join(' ') || 'all', 'running', drip, followups.length, body.stop_on_reply === false ? 0 : 1, now);
     const id = created.meta.last_row_id;
     const sendAt = drip ? `${now} + (ROW_NUMBER() OVER (ORDER BY c.id) - 1) * ${drip * 1000}` : `${now}`;
     const ins = await run(env, `INSERT INTO messages(contact_id, direction, body, status, campaign_id, created_at, send_at)
@@ -695,6 +788,14 @@ const ROUTES = [
           '{{company}}', c.company), '{{name}}', COALESCE(NULLIF(trim(c.first_name || ' ' || c.last_name), ''), 'there')),
         'queued', ${id}, ${now}, ${sendAt} FROM contacts c ${where}`, text, ...f.b);
     const total = ins.meta.changes || 0;
+    // One row per contact per follow-up, parked until the text before it actually goes out.
+    for (const [i, fu] of followups.entries()) {
+      await run(env, `INSERT INTO messages(contact_id, direction, body, status, campaign_id, created_at, send_at, step, delay_ms)
+        SELECT c.id, 'out',
+          replace(replace(replace(replace(?, '{{first_name}}', COALESCE(NULLIF(c.first_name, ''), 'there')), '{{last_name}}', c.last_name),
+            '{{company}}', c.company), '{{name}}', COALESCE(NULLIF(trim(c.first_name || ' ' || c.last_name), ''), 'there')),
+          'queued', ${id}, ${now}, ${NOT_YET}, ${i + 1}, ${fu.delay_ms} FROM contacts c ${where}`, withFooter(fu.body), ...f.b);
+    }
     await run(env, "UPDATE campaigns SET total = ?, status = CASE WHEN ? = 0 THEN 'done' ELSE status END WHERE id = ?", total, total, id);
     return { id, total };
   }],
@@ -711,8 +812,8 @@ const ROUTES = [
         // A drip that sat paused is re-spaced from now so the next texts do not all fire at once.
         const ca = await first(env, 'SELECT drip_seconds FROM campaigns WHERE id = ?', id);
         if (ca?.drip_seconds) {
-          await run(env, `UPDATE messages SET send_at = ? + (SELECT count(*) FROM messages m2 WHERE m2.campaign_id = messages.campaign_id AND m2.status = 'queued' AND m2.id < messages.id) * ?
-            WHERE campaign_id = ? AND status = 'queued'`, Date.now(), ca.drip_seconds * 1000, id);
+          await run(env, `UPDATE messages SET send_at = ? + (SELECT count(*) FROM messages m2 WHERE m2.campaign_id = messages.campaign_id AND m2.step = 0 AND m2.status = 'queued' AND m2.id < messages.id) * ?
+            WHERE campaign_id = ? AND status = 'queued' AND step = 0`, Date.now(), ca.drip_seconds * 1000, id);
         }
       }
     }
@@ -850,7 +951,7 @@ const ROUTES = [
     return first(env, `SELECT
       (SELECT count(*) FROM contacts) AS contacts,
       (SELECT count(*) FROM contacts WHERE unread > 0) AS unread,
-      (SELECT count(*) FROM messages WHERE status IN ('queued', 'sending')) AS queued,
+      (SELECT count(*) FROM messages WHERE status IN ('queued', 'sending') AND send_at < 9000000000000000) AS queued,
       (SELECT count(*) FROM messages WHERE direction = 'out' AND status IN ('sent', 'delivered') AND sent_at >= ?1) AS sms_sent,
       (SELECT count(*) FROM messages WHERE direction = 'in' AND created_at >= ?1) AS replies,
       (SELECT count(*) FROM calls WHERE started_at >= ?1) AS calls,

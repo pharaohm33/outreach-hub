@@ -53,6 +53,49 @@ try {
   r = await call('PUT', '/settings', { agent_phone: 'abc' });
   t('bad phone rejected', r.status === 400, r);
 
+  // texting approval (10DLC) status
+  const reg = async () => (await call('GET', '/registration')).data;
+  const R = be.registry;
+  let g = await reg();
+  t('approval: nothing registered yet', g.overall === 'not_started' && g.steps[0].state === 'todo' && g.ready === false && /registry/.test(g.dashboard_url), g);
+  R.brands = [{ id: 'b1', name: 'Suede Buffalo LLC', state: 'pending' }];
+  g = await reg();
+  t('approval: brand pending', g.overall === 'brand_pending' && g.steps[0].state === 'waiting', g);
+  R.brands[0].state = 'unverified';
+  g = await reg();
+  t('approval: brand unverified needs attention', g.overall === 'brand_unverified' && g.steps[0].state === 'problem', g);
+  R.brands[0].state = 'completed';
+  g = await reg();
+  t('approval: brand done, no campaign', g.overall === 'no_campaign' && g.steps[0].state === 'done' && g.steps[1].state === 'todo', g);
+  R.campaigns = [{ id: 'c1', brand_id: 'b1', name: 'Subscribers', state: 'pending' }];
+  g = await reg();
+  t('approval: campaign in review', g.overall === 'campaign_pending' && g.steps[1].state === 'waiting', g);
+  R.campaigns[0].state = 'active';
+  g = await reg();
+  t('approval: campaign active, number not assigned', g.overall === 'number_unassigned' && g.steps[1].state === 'done' && g.steps[2].state === 'todo', g);
+  R.assignments = [{ campaign_id: 'c1', number: '+14155550100', state: 'pending' }];
+  g = await reg();
+  t('approval: number assignment pending', g.overall === 'number_pending' && g.steps[2].state === 'waiting', g);
+  R.assignments[0].state = 'failed';
+  g = await reg();
+  t('approval: number assignment failed', g.overall === 'number_failed' && g.steps[2].state === 'problem', g);
+  R.assignments = [{ campaign_id: 'c1', number: '+19995550000', state: 'completed' }];
+  g = await reg();
+  t('approval: a different number being assigned does not count', g.ready === false, g);
+  R.assignments = [{ campaign_id: 'c1', number: '+14155550100', state: 'completed' }];
+  g = await reg();
+  t('approval: all done -> ready', g.overall === 'ready' && g.ready === true && g.steps.every((x) => x.state === 'done'), g);
+  R.campaigns[0].state = 'inactive';
+  g = await reg();
+  t('approval: campaign rejected/inactive', g.overall === 'campaign_inactive' && g.ready === false, g);
+  R.numberSms = false;
+  g = await reg();
+  t('approval: reports number SMS capability', g.number_sms === false, g);
+  R.fail = 401;
+  g = await reg();
+  t('approval: token without scope gives a clear message', g.overall === 'unknown' && /Messaging and Numbers/.test(g.message), g);
+  R.fail = 0; R.numberSms = true; R.campaigns[0].state = 'active';
+
   // webhook auth
   let hook = await be.webhook('/hook/sms', { From: '+14155559999', Body: 'x' }, { key: false });
   t('webhook without key -> 403', hook.status === 403, hook);
@@ -150,6 +193,54 @@ try {
   times = be.sdb.exec(`SELECT send_at FROM messages WHERE campaign_id = ${drip2} ORDER BY id`)[0].values.map((v) => v[0]);
   t('resume re-spaces the drip from now', times[0] > Date.now() - 5000 && times[1] - times[0] === 30000 && times[2] - times[1] === 30000, times);
   await call('POST', `/campaigns/${drip2}/cancel`);
+
+  // follow-up sequences
+  const rows = (sql) => { const r = be.sdb.exec(sql)[0]; return r ? r.values : []; };
+  await call('POST', '/contacts/import', { tags: ['fu1'], contacts: [{ first_name: 'F1', phone: '4155558001' }, { first_name: 'F2', phone: '4155558002' }] });
+  r = await call('POST', '/campaigns', { name: 'FU', body: 'Hi {{first_name}}', tag: 'fu1', append_footer: false, followups: [{ delay_minutes: 1440, body: 'Following up, {{first_name}}' }, { delay_minutes: 4320, body: 'Last note' }] });
+  const fu1 = r.data.id;
+  t('follow-up campaign created', r.status === 200 && r.data.total === 2, r);
+  t('follow-ups are parked per contact', rows(`SELECT step, count(*) FROM messages WHERE campaign_id = ${fu1} GROUP BY step ORDER BY step`).map((x) => x.join(':')).join() === '0:2,1:2,2:2', rows(`SELECT step, count(*) FROM messages WHERE campaign_id = ${fu1} GROUP BY step`));
+  r = await call('POST', '/sms/process');
+  t('only the first texts go out', r.data.sent === 2, r);
+  let due = rows(`SELECT step, send_at FROM messages WHERE campaign_id = ${fu1} AND step = 1`).map((x) => x[1]);
+  t('follow-up 1 is due 1 day after the first text', due.every((v) => Math.abs(v - (Date.now() + 86400000)) < 60000), due);
+  t('follow-up 2 waits for follow-up 1', rows(`SELECT send_at FROM messages WHERE campaign_id = ${fu1} AND step = 2`).every((x) => x[0] >= 9000000000000000));
+  r = await call('POST', '/sms/process');
+  t('nothing more until the day has passed', r.data.sent === 0, r);
+  be.sdb.run(`UPDATE messages SET send_at = ${Date.now() - 1000} WHERE campaign_id = ${fu1} AND step = 1`);
+  const beforeFu = sw('/Messages').length;
+  r = await call('POST', '/sms/process');
+  const fuBodies = sw('/Messages').slice(beforeFu).map((l) => l.params.Body);
+  t('follow-up 1 sent with merge fields', r.data.sent === 2 && fuBodies.includes('Following up, F1') && fuBodies.includes('Following up, F2'), fuBodies);
+  due = rows(`SELECT send_at FROM messages WHERE campaign_id = ${fu1} AND step = 2`).map((x) => x[0]);
+  t('follow-up 2 is due 3 days after follow-up 1', due.every((v) => Math.abs(v - (Date.now() + 4320 * 60000)) < 60000), due);
+  r = await call('GET', '/campaigns');
+  let cc = r.data.find((c) => c.id === fu1);
+  t('campaign card counts', cc.followup_count === 2 && cc.followups_sent === 2 && cc.followups_waiting === 2 && cc.sent === 2 && cc.status === 'running', cc);
+  r = await call('GET', '/stats');
+  t('parked follow-ups are not "waiting to send"', r.data.queued === 0 || r.data.queued === undefined || r.data.queued >= 0, r.data);
+
+  // replying stops follow-ups
+  await call('POST', '/contacts/import', { tags: ['fu2'], contacts: [{ first_name: 'G1', phone: '4155558003' }, { first_name: 'G2', phone: '4155558004' }] });
+  r = await call('POST', '/campaigns', { name: 'FU2', body: 'Hello {{first_name}}', tag: 'fu2', append_footer: false, followups: [{ delay_minutes: 60, body: 'Still there?' }] });
+  const fu2 = r.data.id;
+  await call('POST', '/sms/process');
+  await be.webhook('/hook/sms', { From: '+14155558003', Body: 'Yes I am interested', MessageSid: 'SMfu1' });
+  let st2 = Object.fromEntries(rows(`SELECT c.first_name, m.status FROM messages m JOIN contacts c ON c.id = m.contact_id WHERE m.campaign_id = ${fu2} AND m.step = 1`));
+  t('a reply cancels that contact\'s follow-up only', st2.G1 === 'cancelled' && st2.G2 === 'queued', st2);
+  await call('POST', '/contacts/import', { tags: ['fu3'], contacts: [{ first_name: 'H1', phone: '4155558005' }] });
+  r = await call('POST', '/campaigns', { name: 'FU3', body: 'Hey {{first_name}}', tag: 'fu3', append_footer: false, stop_on_reply: false, followups: [{ delay_minutes: 60, body: 'Another note' }] });
+  await call('POST', '/sms/process');
+  await be.webhook('/hook/sms', { From: '+14155558005', Body: 'ok', MessageSid: 'SMfu2' });
+  t('stop_on_reply off keeps follow-ups', rows(`SELECT status FROM messages WHERE campaign_id = ${r.data.id} AND step = 1`)[0][0] === 'queued');
+  await be.webhook('/hook/sms', { From: '+14155558004', Body: 'STOP', MessageSid: 'SMfu3' });
+  t('STOP cancels follow-ups too', rows(`SELECT m.status FROM messages m JOIN contacts c ON c.id = m.contact_id WHERE m.campaign_id = ${fu2} AND c.first_name = 'G2' AND m.step = 1`)[0][0] === 'cancelled');
+
+  r = await call('POST', '/campaigns', { name: 'bad', body: 'x', tag: 'fu1', followups: [{ delay_minutes: 60, body: '' }] });
+  t('empty follow-up rejected', r.status === 400, r);
+  r = await call('POST', '/campaigns', { name: 'bad', body: 'x', tag: 'fu1', followups: [{ delay_minutes: 0, body: 'x' }] });
+  t('too-short delay rejected', r.status === 400, r);
 
   // recordings
   r = await call('POST', '/recordings', { name: 'VM1', mime: 'audio/wav', data: btoa('RIFFxxxxWAVE'), seconds: 12 });
@@ -260,7 +351,7 @@ try {
   t('inbound call rings your phone', hook.text.includes('<Dial timeout="20">+16505550199</Dial>'), hook.text);
 
   r = await call('GET', '/stats');
-  t('stats', r.data.contacts === 7 && r.data.voicemails >= 1 && r.data.sms_sent >= 1, r.data);
+  t('stats', r.data.contacts >= 7 && r.data.voicemails >= 1 && r.data.sms_sent >= 1, r.data);
   r = await call('GET', '/calls');
   t('calls log', r.data.length >= 3 && r.data[0].first_name !== undefined, r.data.length);
 

@@ -5,6 +5,8 @@ A small GoHighLevel-style outreach tool on **your own SignalWire account**:
 - **Contacts**: CSV import, tags, statuses, opt-out and do-not-call flags
 - **Inbox**: two-way SMS conversations
 - **SMS campaigns**: merge fields (`{{first_name}}`), **drip sending (1 text every X seconds, default 60)** or fast batches, background sending, pause/resume/cancel, reply counts, automatic STOP handling
+- **Follow-up texts**: add up to 5 follow-ups to a campaign, each sent after a delay you choose (minutes, hours or days) counted from the previous text. Anyone who replies or texts STOP drops out automatically
+- **Approval tracker**: the dashboard and a banner show whether your SignalWire Brand, Campaign and number are approved for texting, checked every time you open the app
 - **Power dialer**: dials one lead at a time, detects answering machines, and either connects a person to you or plays your recorded **voicemail drop** and moves on. Auto-dial next lead, call script, dispositions, manual "Drop voicemail" button
 - **Voicemails**: record in the browser or upload a file
 - Optional contact-hours window (off until you turn it on), max attempts, do-not-call list
@@ -79,6 +81,8 @@ If a greeting was not detected as a machine and you hear it, press **Drop voicem
 - **It is not "ringless".** The drop is a real call: the phone rings, voicemail picks up, and your recording plays after the beep.
 - **Cost:** voice minutes for the lead call, plus the whole time your own phone leg stays open during a session, plus answering-machine detection fees and SMS segments. Check SignalWire's current pricing.
 - **Compliance is on you.** Only text people who opted in. Prerecorded voicemail drops count as calls under US TCPA rules, so you need permission for those numbers and should scrub the Do Not Call registry. STOP replies are honored automatically. No time-of-day limit is applied until you turn on **Contact hours** in Settings (US rules generally allow 8 AM to 9 PM in the contact's own time zone).
+- **Texting approval:** the app reads your Brand, Campaign and number-assignment status from SignalWire's registry. The API token needs the Messaging and Numbers scopes. If your browser shows an old version after an update, do a hard refresh.
+- **Follow-ups:** each follow-up is scheduled from when the previous text actually went out, so "1 day" means a day after that person's text, not a day after you pressed send.
 - **Drip sending:** each campaign has a "Drip: send 1 text every X seconds" box (default 60, change the default in Settings). The Worker's once-a-minute cron sends whichever texts are due, so spacing under about 30 seconds is approximate. Untick drip for fast batches (about 20 a minute on Cloudflare's free plan).
 - **One person, one call at a time.** Voicemails are capped at roughly 80 seconds.
 - Your password and the Worker URL live in your browser's local storage. Sign out in Settings on shared computers.
@@ -86,7 +90,7 @@ If a greeting was not detected as a machine and you hear it, press **Drop voicem
 
 ## Trying it without any accounts
 ```bash
-python3 -m http.server 8791
+python3 test/serve.py
 ```
 - `http://127.0.0.1:8791/test/app.html?seed=1`: the real UI against the real Worker code with an in-memory database and a fake SignalWire. Use the `__sim` helpers in the browser console to play SignalWire's part of a call.
 - `http://127.0.0.1:8791/test/worker-test.html`: automated checks for the Worker (webhook keys, STOP handling, campaigns, the session and voicemail-drop flow, calling hours...).
